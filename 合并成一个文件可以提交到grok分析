@@ -1,0 +1,3522 @@
+#include <stdio.h>
+#include <string.h> /*strcmp()*/
+#include <pthread.h>
+#include "Joiner.h"
+#include "Parser.h"
+#include "JobScheduler.h"
+#include "Optimizer.h"
+
+
+int main(int argc, char const *argv[])
+{
+		// Create a new Joiner
+		// Joiner holds meta data for every relation
+		struct Joiner* joiner;
+		createJoiner(&joiner);
+
+    // Read join relations and load them to memory
+    setup(joiner);
+
+		// Create Job Scheduler[worker threads,JobQueue, e.t.c]
+		createJobScheduler(&js);
+
+    // Read query line
+    // Parse query by splitting it into parts
+		// Find estimations using the statistics of each column
+		// Find the optimal join order
+    // Execute query and write checksum to stdout
+    // Destroy query
+		struct QueryInfo *q;
+		char buffer[BUFFERSIZE];
+		while (fgets(buffer, sizeof(buffer), stdin) != NULL)
+		{
+			if(!strcmp(buffer,"F\n"))continue;
+
+			createQueryInfo(&q,buffer);
+			createQueryEstimations(q,joiner);
+
+			applyColEqualityEstimations(q,joiner);
+			applyFilterEstimations(q,joiner);
+			applyJoinEstimations(q,joiner);
+			// findOptimalJoinOrder(q,joiner);
+			join(joiner,q);
+			destroyQueryInfo(q);
+		}
+
+	  // Cleanup memory
+		destroyJobScheduler(js);
+		destroyJoiner(joiner);
+		return 0;
+} #include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/time.h>
+#include <thread>
+#include <unistd.h>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <vector>
+//---------------------------------------------------------------------------
+using namespace std;
+//---------------------------------------------------------------------------
+const unsigned long MAX_FAILED_QUERIES = 100;
+//---------------------------------------------------------------------------
+static void usage() {
+  cerr << "Usage: harness <init-file> <workload-file> <result-file> <test-executable>" << endl;
+}
+//---------------------------------------------------------------------------
+static int set_nonblocking(int fd)
+// Set a file descriptor to be non-blocking
+{
+  int flags = fcntl(fd, F_GETFL, 0);
+  if (flags < 0) return flags;
+  return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+//---------------------------------------------------------------------------
+static ssize_t read_bytes(int fd, void *buffer, size_t num_bytes)
+// Read a given number of bytes to the specified file descriptor
+{
+  char *p = (char *)buffer;
+  char *end = p + num_bytes;
+  while (p != end) {
+    ssize_t res = read(fd, p, end - p);
+    if (res < 0) {
+      if (errno == EINTR) continue;
+      return res;
+    }
+    p += res;
+  }
+
+  return num_bytes;
+}
+//---------------------------------------------------------------------------
+static ssize_t write_bytes(int fd, const void *buffer, size_t num_bytes)
+// Write a given number of bytes to the specified file descriptor
+{
+  const char *p = (const char *)buffer;
+  const char *end = p + num_bytes;
+  while (p != end) {
+    ssize_t res = write(fd, p, end - p);
+    if (res < 0) {
+      if (errno == EINTR) continue;
+      return res;
+    }
+    p += res;
+  }
+
+  return num_bytes;
+}
+
+//---------------------------------------------------------------------------
+int main(int argc, char *argv[]) {
+  // Check for the correct number of arguments
+  if (argc != 5) {
+    usage();
+    exit(EXIT_FAILURE);
+  }
+
+  vector<string> input_batches;
+  vector<vector<string> > result_batches;
+
+  // Load the workload and result files and parse them into batches
+  {
+    ifstream work_file(argv[2]);
+    if (!work_file) {
+      cerr << "Cannot open workload file" << endl;
+      exit(EXIT_FAILURE);
+    }
+
+    ifstream result_file(argv[3]);
+    if (!result_file) {
+      cerr << "Cannot open result file" << endl;
+      exit(EXIT_FAILURE);
+    }
+
+    string input_chunk;
+    input_chunk.reserve(100000);
+
+    vector<string> result_chunk;
+    result_chunk.reserve(150);
+
+    string line;
+    while (getline(work_file, line)) {
+      input_chunk += line;
+      input_chunk += '\n';
+
+      if (line.length() > 0 && (line[0] != 'F')) {
+        // Add result
+        string result;
+        getline(result_file, result);
+        result_chunk.emplace_back(move(result));
+      } else {
+        // End of batch
+        // Copy input and results
+        input_batches.push_back(input_chunk);
+        result_batches.push_back(result_chunk);
+        input_chunk="";
+        result_chunk.clear();
+      }
+    }
+  }
+
+  // Create pipes for child communication
+  int stdin_pipe[2];
+  int stdout_pipe[2];
+  if (pipe(stdin_pipe) == -1 || pipe(stdout_pipe) == -1) {
+    perror("pipe");
+    exit(EXIT_FAILURE);
+  }
+
+  // Start the test executable
+  pid_t pid = fork();
+  if (pid == -1) {
+    perror("fork");
+    exit(EXIT_FAILURE);
+  } else if (pid == 0) {
+    dup2(stdin_pipe[0], STDIN_FILENO);
+    close(stdin_pipe[0]);
+    close(stdin_pipe[1]);
+    dup2(stdout_pipe[1], STDOUT_FILENO);
+    close(stdout_pipe[0]);
+    close(stdout_pipe[1]);
+    execlp(argv[4], argv[4], (char *)NULL);
+    perror("execlp");
+    exit(EXIT_FAILURE);
+  }
+  close(stdin_pipe[0]);
+  close(stdout_pipe[1]);
+
+  // Open the file and feed the initial relations
+  int init_file = open(argv[1], O_RDONLY);
+  if (init_file == -1) {
+    cerr << "Cannot open init file" << endl;
+    exit(EXIT_FAILURE);
+  }
+
+  while (1) {
+    char buffer[4096];
+    ssize_t bytes = read(init_file, buffer, sizeof(buffer));
+    if (bytes < 0) {
+      if (errno == EINTR) continue;
+      perror("read");
+      exit(EXIT_FAILURE);
+    }
+    if (bytes == 0) break;
+    ssize_t written = write_bytes(stdin_pipe[1], buffer, bytes);
+    if (written < 0) {
+      perror("write");
+      exit(EXIT_FAILURE);
+    }
+  }
+
+  close(init_file);
+
+  // Signal the end of the initial phase
+  ssize_t status_bytes = write_bytes(stdin_pipe[1], "Done\n", 5);
+  if (status_bytes < 0) {
+    perror("write");
+    exit(EXIT_FAILURE);
+  }
+
+
+#if 1
+  // Wait for 1 second
+  this_thread::sleep_for(1s);
+
+#else
+  // Wait for the ready signal
+  char status_buffer[6];
+  status_bytes = read_bytes(stdout_pipe[0], status_buffer, sizeof(status_buffer));
+  if (status_bytes < 0) {
+    perror("read");
+    exit(EXIT_FAILURE);
+  }
+
+  if (status_bytes != sizeof(status_buffer) || (status_buffer[0] != 'R' && status_buffer[0] != 'r') ||
+      status_buffer[5] != '\n') {
+    cerr << "Test program did not return ready status" << endl;
+    exit(EXIT_FAILURE);
+  }
+#endif
+
+  // Use select with non-blocking files to read and write from the child process, avoiding deadlocks
+  if (set_nonblocking(stdout_pipe[0]) == -1) {
+    perror("fcntl");
+    exit(EXIT_FAILURE);
+  }
+
+  if (set_nonblocking(stdin_pipe[1]) == -1) {
+    perror("fcntl");
+    exit(EXIT_FAILURE);
+  }
+
+  // Start the stopwatch
+  struct timeval start;
+  gettimeofday(&start, NULL);
+
+  unsigned long query_no = 0;
+  unsigned long failure_cnt = 0;
+
+  // Loop over all batches
+  for (unsigned long batch = 0; batch != input_batches.size() && failure_cnt < MAX_FAILED_QUERIES; ++batch) {
+    string output;  // raw output is collected here
+    output.reserve(1000000);
+
+    size_t input_ofs = 0;    // byte position in the input batch
+    size_t output_read = 0;  // number of lines read from the child output
+
+    while (input_ofs != input_batches[batch].length() || output_read < result_batches[batch].size()) {
+      fd_set read_fd, write_fd;
+      FD_ZERO(&read_fd);
+      FD_ZERO(&write_fd);
+
+      if (input_ofs != input_batches[batch].length()) FD_SET(stdin_pipe[1], &write_fd);
+
+      if (output_read != result_batches[batch].size()) FD_SET(stdout_pipe[0], &read_fd);
+
+      int retval = select(max(stdin_pipe[1], stdout_pipe[0]) + 1, &read_fd, &write_fd, NULL, NULL);
+      if (retval == -1) {
+        perror("select");
+        exit(EXIT_FAILURE);
+      }
+
+      // Read output from the test program
+      if (FD_ISSET(stdout_pipe[0], &read_fd)) {
+        char buffer[4096];
+        int bytes = read(stdout_pipe[0], buffer, sizeof(buffer));
+        if (bytes < 0) {
+          if (errno == EINTR) continue;
+          perror("read");
+          exit(1);
+        }
+        // Count how many lines were returned
+        for (size_t j = 0; j != size_t(bytes); ++j) {
+          if (buffer[j] == '\n') ++output_read;
+        }
+        output.append(buffer, bytes);
+      }
+
+      // Feed another histogram of data from this batch to the test program
+      if (FD_ISSET(stdin_pipe[1], &write_fd)) {
+        int bytes =
+            write(stdin_pipe[1], input_batches[batch].data() + input_ofs, input_batches[batch].length() - input_ofs);
+        if (bytes < 0) {
+          if (errno == EINTR) continue;
+          perror("write");
+          exit(EXIT_FAILURE);
+        }
+        input_ofs += bytes;
+      }
+    }
+
+    // Parse and compare the batch result
+    stringstream result(output);
+
+    for (unsigned i = 0; i != result_batches[batch].size() && failure_cnt < MAX_FAILED_QUERIES; ++i) {
+      string val;
+
+      // result >> val;
+      getline(result, val);
+      if (!result) {
+        cerr << "Incomplete batch output for batch " << batch << endl;
+        exit(EXIT_FAILURE);
+      }
+
+      bool matched = val == result_batches[batch][i];
+      if (!matched) {
+        // cerr << "Result mismatch for query " << query_no << ", expected: " <<"\""<<result_batches[batch][i]<<"\""
+        //           << ", actual: " <<"\""<<val<<"\"" << endl;
+        ++failure_cnt;
+      }
+      /*if (matched)
+      {
+          cout << endl << val << endl <<  endl << result_batches[batch][i];
+      }*/
+      ++query_no;
+    }
+  }
+
+  struct timeval end;
+  gettimeofday(&end, NULL);
+
+  if (failure_cnt == 0) {
+    // Output the elapsed time in milliseconds
+    double elapsed_sec = (end.tv_sec - start.tv_sec) + (end.tv_usec - start.tv_usec) / 1000000.0;
+    // cout << (long)(elapsed_sec * 1000) << endl;
+    cout << "======================" << endl;
+    cout << "Elapsed time: " << (long)(elapsed_sec * 1000) << " ms" << endl;
+    cout << "======================" << endl;
+    return EXIT_SUCCESS;
+  }
+  return EXIT_FAILURE;
+}
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>/*strlen()*/
+#include <pthread.h>
+
+#include "Vector.h"
+#include "Utils.h"
+#include "JobScheduler.h"
+
+unsigned initSize;
+
+void createVector(struct Vector **vector,unsigned tupleSize)
+{
+	// *vector              = malloc(sizeof(struct Vector));
+	int err;
+	if( err = posix_memalign((void **)vector,128,sizeof(struct Vector)))
+	{
+			perror("posix_memalign failed.Exiting...");
+			exit(EXIT_FAILURE);
+	}
+	MALLOC_CHECK(*vector);
+	(*vector)->table     = NULL;
+	(*vector)->tupleSize = tupleSize;
+	(*vector)->nextPos   = 0;
+	(*vector)->capacity  = 0;
+}
+
+void createVectorFixedSize(struct Vector **vector,unsigned tupleSize,unsigned fixedSize)
+{
+	*vector              = malloc(sizeof(struct Vector));
+	MALLOC_CHECK(*vector);
+	(*vector)->capacity  = tupleSize*fixedSize;
+	(*vector)->tupleSize = tupleSize;
+	(*vector)->table     = malloc((*vector)->capacity *sizeof(unsigned));
+	MALLOC_CHECK((*vector)->table);
+	(*vector)->nextPos   = 0;
+}
+
+void insertAtVector(struct Vector *vector,unsigned *tuple)
+{
+	/* If vector is empty , create table */
+	if(vectorIsEmpty(vector))
+	{
+		/* initSize is initialized according to avgNumOfTuples of the given relations */
+		/* check Joiner.c */
+		vector->capacity = initSize*vector->tupleSize;
+		vector->table    = malloc(vector->capacity*sizeof(unsigned));
+		MALLOC_CHECK(vector->table);
+	}
+
+	/* Else if vector is full, remalloc more space */
+	else if(vectorIsFull(vector))
+	{
+		vector->capacity*=2;
+		unsigned *new   = realloc(vector->table,vector->capacity*sizeof(unsigned));
+		if(!new)
+		{
+			fprintf(stderr,"realloc failed[insertAtVector]\nExiting...\n");
+			exit(EXIT_FAILURE);
+		}
+		vector->table    = new;
+		// fprintf(stderr, "realloc() has been called\n");
+	}
+
+	/* Insert tuple */
+	unsigned pos     	= vector->nextPos;
+	for(unsigned i=0;i<vector->tupleSize;++i)
+		vector->table[pos+i] = tuple[i];
+
+	vector->nextPos+=vector->tupleSize;
+}
+
+/* Caution: This function will be called only for fixed size vectors */
+/* Useful in case we want to insert a tuple in a specific offset inside the vector */
+void insertAtPos(struct Vector *vector,unsigned *tuple,unsigned offset)
+{
+	unsigned pos = offset*vector->tupleSize;
+	for(unsigned i=0;i<vector->tupleSize;++i)
+		vector->table[pos+i] = tuple[i];
+	vector->nextPos += vector->tupleSize;
+}
+
+void printVector(struct Vector *vector)
+{
+	if(vector->nextPos==0)
+	{
+		// fprintf(stderr,"Vector is empty\n");
+		return;
+	}
+	/* nextPos holds the number of the rowIds */
+	/* which is the same with the first available position in vector */
+	unsigned k=0;
+	for(unsigned i=0;i<vector->nextPos;++i)
+		if(i%vector->tupleSize==0)
+		{
+			if(k++==10) // Stop after printing the first 10 tuples
+				break;
+			printTuple(vector,i);
+		}
+}
+
+void printTuple(struct Vector *vector,unsigned pos)
+{
+	fprintf(stderr,"(");
+	for(unsigned i=0;i<vector->tupleSize;++i)
+		if(i==vector->tupleSize-1)
+			fprintf(stderr,"%u",vector->table[pos+i]+1);
+		else
+			fprintf(stderr,"%u,",vector->table[pos+i]+1);
+	fprintf(stderr,")\n");
+}
+
+void scanColEquality(struct Vector *new,struct Vector* old,uint64_t *leftCol,uint64_t* rightCol,unsigned posLeft,unsigned posRight)
+{
+	/* Note: Each tuple in old vector contains one rowId */
+	/* Except for the case of join between relations from the same intermediate entity[i.e: vector] */
+	for(unsigned i=0;i<old->nextPos;i+=old->tupleSize)
+		if(leftCol[old->table[i+posLeft]] == rightCol[old->table[i+posRight]])
+			insertAtVector(new,&old->table[i]);
+}
+
+void scanFilter(struct Vector *new,struct Vector* old,uint64_t *col,Comparison cmp,uint64_t constant)
+{
+	/* Note: Each tuple in old vector contains one rowId */
+	/* Insert every tuple of the old vector to the new one, if it satisfies the filter */
+	for(unsigned i=0;i<old->nextPos;++i)
+		if(compare(col[old->table[i]],cmp,constant))
+			insertAtVector(new,&old->table[i]);
+}
+
+// Fill info with values and tuples
+void scanJoin(RadixHashJoinInfo *joinRel)
+{
+	struct Vector *old;
+	struct Vector *new  = joinRel->unsorted->tuples;
+	unsigned sizeOfVector;
+
+	// Position of this relation's rowId inside tuple
+	unsigned tupleOffset  = joinRel->map[joinRel->relId];
+
+	uint64_t *origValues  = joinRel->col;
+	uint64_t *colValues   = joinRel->unsorted->values;
+	unsigned *rowIds      = joinRel->unsorted->rowIds;
+
+	unsigned k=0;
+	// We scan the old vectors [i.e: the intermediate result]
+	for(unsigned v=0;v<HASH_RANGE_1;++v)
+	{
+		if(old = joinRel->vector[v])
+		for(unsigned i=0;i<old->nextPos;i+=old->tupleSize)
+		{
+			unsigned origRowId = old->table[i+tupleOffset];
+			// Add value
+			colValues[k]       = origValues[origRowId];
+			// Add tuple
+			insertAtVector(new,&old->table[i]);
+			// Add rowId
+			rowIds[k++]        = k;
+		}
+	}
+}
+
+void destroyVector(struct Vector **vector)
+{
+	if(*vector==NULL)
+	{
+		// fprintf(stderr,"Vector is empty\n");
+		return;
+	}
+	free((*vector)->table);
+	free(*vector);
+	*vector = NULL;
+}
+
+int vectorIsFull(struct Vector *vector)
+{
+	return vector->nextPos == vector->capacity;
+}
+
+int vectorIsEmpty(struct Vector *vector)
+{
+	return vector->table == NULL;
+}
+
+unsigned getVectorTuples(struct Vector *vector)
+{
+	return vector->nextPos/vector->tupleSize;
+}
+
+/* Returns a pointer to the i-th tuple */
+unsigned *getTuple(struct Vector *vector,unsigned i)
+{
+	if(i>vector->nextPos/vector->tupleSize)
+	{
+		fprintf(stderr, "Trying to access a tuple that does not exist\nExiting...\n\n");
+		exit(EXIT_FAILURE);
+	}
+	return 	&vector->table[i*vector->tupleSize];
+}
+
+unsigned getTupleSize(struct Vector *vector)
+{return vector->tupleSize;}
+
+
+uint64_t checkSum(struct Vector *vector,uint64_t *col,unsigned rowIdPos)
+{
+	uint64_t sum=0;
+	for(unsigned i=0;i<vector->nextPos;i+=vector->tupleSize)
+		sum+=col[vector->table[i+rowIdPos]];
+	return sum;
+}
+
+void checkSumFunc(void *arg){
+	struct checkSumArg *myarg = arg;
+	*myarg->sum=0;
+	for(unsigned i=0;i<myarg->vector->nextPos;i+=myarg->vector->tupleSize)
+		*myarg->sum+=myarg->col[myarg->vector->table[i+myarg->rowIdPos]];
+	pthread_mutex_lock(&jobsFinishedMtx);
+	++jobsFinished;
+	pthread_cond_signal(&condJobsFinished);
+	pthread_mutex_unlock(&jobsFinishedMtx);
+}
+
+
+void colEqualityFunc(void *arg)
+{
+	struct colEqualityArg *myarg = arg;
+	for(unsigned i=0;i<myarg->old->nextPos;i+=myarg->old->tupleSize)
+		if(myarg->leftCol[myarg->old->table[i+myarg->posLeft]] == myarg->rightCol[myarg->old->table[i+myarg->posRight]])
+			insertAtVector(myarg->new,&myarg->old->table[i]);
+	pthread_mutex_lock(&jobsFinishedMtx);
+	++jobsFinished;
+	pthread_cond_signal(&condJobsFinished);
+	pthread_mutex_unlock(&jobsFinishedMtx);
+}  #include <stdint.h>/* uint64_t */
+
+#include "Utils.h"
+
+int compare(uint64_t key,Comparison cmp,uint64_t constant)
+{
+	switch(cmp)
+	{
+		case '=':
+			return key==constant;
+		case '<':
+			return key<constant;
+		case '>':
+			return key>constant;
+	}
+}
+
+uint64_t power(uint64_t base, uint64_t exponent)
+{
+	if (exponent == 0)
+		return 1;
+	else if (exponent % 2 == 0)
+	{
+		uint64_t temp = power(base, exponent / 2);
+		return temp * temp;
+	}
+	else
+		return base * power(base, exponent - 1);
+}
+
+uint64_t linearPower(uint64_t base, uint64_t exponent)
+{
+	uint64_t res = 1;
+	for (uint64_t i = 0; i < exponent; ++i)
+		res *= base;
+	return res;
+} #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
+
+#include "Relation.h"
+#include "Utils.h"
+#include "Optimizer.h"
+
+
+void createRelation(struct Relation **rel,char *fileName)
+{
+	*rel = malloc(sizeof(struct Relation));
+	MALLOC_CHECK(*rel);
+	(*rel)->columns = NULL;
+	loadRelation(*rel,fileName);
+
+	// Allocate space for stats
+	(*rel)->stats = malloc((*rel)->numOfCols*sizeof(struct columnStats));
+	MALLOC_CHECK((*rel)->stats);
+
+	// Calculate stats for every column of the relation
+	for (unsigned i = 0; i < (*rel)->numOfCols; ++i)
+	{
+		findStats((*rel)->columns[i], &(*rel)->stats[i], (*rel)->numOfTuples);
+		// fprintf(stderr, "Relation[%s]\n",fileName);
+		// printColumnStats(&(*rel)->stats[i]);
+	}
+	// fprintf(stderr, "\n\n\n");
+}
+
+void loadRelation(struct Relation *rel,char *fileName)
+{
+	int fd;
+
+	/* Open relation file */
+	if( (fd = open(fileName, O_RDONLY)) == -1){
+		perror("open failed[loadRelation]");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Find its size (in bytes) */
+	struct stat sb;
+	if (fstat(fd,&sb)==-1){
+		perror("fstat failed[loadRelation]");
+		exit(EXIT_FAILURE);
+	}
+
+	unsigned fileSize = sb.st_size;
+	if (fileSize<16){
+		fprintf(stderr,"Relation file \"%s\" does not contain a valid header",fileName);
+		exit(EXIT_FAILURE);
+	}
+
+	/* Map file to memory */
+	char *addr;
+	if(  (addr = mmap(NULL,fileSize,PROT_READ,MAP_PRIVATE,fd,0u)) == MAP_FAILED ){
+
+		perror("mmap failed[loadRelation]");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Fetch numOfTuples & numOfCols */
+	rel->numOfTuples = *((uint64_t*) addr);
+	addr+=sizeof((uint64_t)rel->numOfTuples);
+	rel->numOfCols = *((uint64_t*) addr);
+	addr+=sizeof((uint64_t)rel->numOfCols);
+
+	rel->columns = malloc(rel->numOfCols*sizeof(uint64_t*));
+	MALLOC_CHECK(rel->columns);
+
+	/* Map every relation's column to rel->columns array */
+	for (unsigned i=0;i<rel->numOfCols;++i)
+	{
+		rel->columns[i] = (uint64_t*) addr;
+		addr+=rel->numOfTuples*sizeof(uint64_t);
+	}
+
+	/* Closing the file does not affect mmap according to man page */
+	close(fd);
+}
+
+void dumpRelation(struct Relation *rel,char *fileName)
+{
+	/* Create path */
+	char path[100] = "../../dumpFiles/";
+	strcat(path,fileName);
+	strcat(path,".dump");
+
+	FILE* fp;
+	if(  (fp=fopen(path,"w"))==NULL)
+	{
+		perror("fopen failed[dumpRelation]");
+		exit(EXIT_FAILURE);
+	}
+
+	for (unsigned i=0;i<rel->numOfTuples;++i)
+	{
+		for(unsigned j=0;j<rel->numOfCols;++j)
+			fprintf(fp,"%lu|", rel->columns[j][i]);
+		fprintf(fp,"\n");
+	}
+	fclose(fp);
+}
+
+void printRelation(struct Relation *rel)
+{
+	for (unsigned i=0;i<rel->numOfTuples;++i)
+	{
+		for(unsigned j=0;j<rel->numOfCols;++j)
+			printf("%lu|", rel->columns[j][i]);
+		printf("\n");
+	}
+}
+
+void destroyRelation(struct Relation *rel)
+{
+	/**
+	 * It is recommened to call munmap(...) but the process is going
+	 * to terminate anyway afterwards.
+	 */
+	for(unsigned i=0;i<rel->numOfCols;++i)
+		free(rel->stats[i].bitVector);
+	free(rel->stats);
+	free(rel->columns);
+	free(rel);
+}  #include <stdio.h>
+#include <stdlib.h>
+
+#include "Queue.h"
+#include "Utils.h"
+
+void createQueue(struct Queue **q, int size)
+{
+	/* Dynamic */
+	*q          = malloc(sizeof(struct Queue));
+	MALLOC_CHECK(*q);
+	(*q)->array = malloc(sizeof(int) * size);
+	MALLOC_CHECK((*q)->array);
+
+	/* Data for ds */
+	(*q)->size = size;
+	(*q)->front = -1;
+	(*q)->rear = -1;
+
+}
+
+void destroyQueue(struct Queue *q)
+{
+	free(q->array);
+	free(q);
+}
+
+int enQueue(struct Queue *q, void* item)
+{
+	// fprintf(stderr,"item %p\n", item);
+	if ( ((q->rear == q->size - 1) && (q->front == 0)) || (q->rear == (q->front - 1) % (q->size - 1)) )
+	{
+		// display(q);
+		fprintf(stderr, "%s\n", "Circular Queue is full");
+		return 0;
+	}
+	/* This is the first item inserted */
+	else if (q->front == -1)
+	{
+		q->rear     = 0;
+		q->front    = 0;
+		q->array[0] = item;
+	}
+	/* When the rear has reached the end but there is still space in the array
+		we just move rear to the begining of the queue */
+	else if ( (q->rear == q->size - 1) && (q->front != 0))
+	{
+		q->rear           = 0;
+		q->array[q->rear] = item;
+	}
+	/* just insert in the next position */
+	else
+		q->array[++(q->rear)] = item;
+}
+
+int isEmpty(struct Queue *q){
+	return (q->front == -1);
+}
+
+void* deQueue(struct Queue *q)
+{
+	if (q->front == -1)
+	{
+		fprintf(stderr, "%s\n", "Circular Queue is empty");
+		return 0;
+	}
+
+	void* value = q->array[q->front];
+
+	/* We had an one item queue if this is true */
+	if (q->front == q->rear)
+		q->front = q->rear = -1;
+	/* we have reached the end , so we start extracting from the start again */
+	else if (q->front == q->size - 1)
+		q->front = 0;
+	/* we just go to the next element */
+	else
+		++(q->front);
+
+	return value;
+}
+
+
+void display(struct Queue *q)
+{
+	printf("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n");
+	fprintf(stderr,"front is :%d \n", q->front);
+	fprintf(stderr,"rear is :%d \n", q->rear);
+	for (int i = 0; i < q->size; i++)
+		fprintf(stderr,"%p| ", q->array[i]);
+	fprintf(stderr,"\n");
+	fprintf(stderr,"~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n");
+}  #include <stdio.h>
+#include <stdlib.h> /*malloc() and free()*/
+#include <string.h>/* strerror() */
+#include <errno.h>/* errno */
+#include <pthread.h>
+
+#include "Probe.h"
+#include "Vector.h"
+#include "Build.h"
+#include "Utils.h"
+#include "JobScheduler.h"
+
+void joinFunc(void *arg){
+
+	struct joinArg *myarg = arg;
+	RadixHashJoinInfo *left,*right;
+	left                   = myarg->left;
+	right                  = myarg->right;
+	struct Vector* results = myarg->results;
+	unsigned searchBucket  = myarg->bucket;
+
+	unsigned i;
+	unsigned searchValue;
+	uint64_t hash;
+	unsigned start;
+	int k;
+	struct Index *searchIndex;
+
+	RadixHashJoinInfo *big,*small;
+	big   = left->isSmall ? right:left;
+	small = left->isSmall ? left:right;
+
+	/* The range that current thread is responsible for */
+	unsigned tStart = big->pSum[searchBucket];
+	unsigned tEnd   = tStart + big->hist[searchBucket];
+
+	unsigned *tupleToInsert;
+	unsigned tupleSize  = small->tupleSize+big->tupleSize;
+	tupleToInsert = malloc(tupleSize*sizeof(unsigned));
+	MALLOC_CHECK(tupleToInsert);
+
+	/* For every tuple(i.e:record) in the big relation */
+	for(i=tStart;i<tEnd;i++)
+	{
+		/* The value we are gonna search for */
+		searchValue = big->sorted->values[i];
+
+		/**
+		 * Find out in which bucket of the small relation
+		 * we should search.
+		 *
+		 * No need for that, as each thread is assigned
+		 * a specific bucket to work on.
+		 */
+		// searchBucket = HASH_FUN_1(searchValue);
+
+		/* Bucket is empty, there is nothing to search here */
+		if(small->hist[searchBucket] == 0)
+			continue;
+
+		/* Fetch starting point of the bucket */
+		start = small->pSum[searchBucket];
+
+		/* Fetch the index of this bucket */
+		searchIndex = small->indexArray[searchBucket];
+
+		/* Find out where to look for in the bucketArray of the index */
+		hash = HASH_FUN_2(searchValue);
+
+		/* Bucket is not empty, but there is no value equal to the searchValue */
+		if(searchIndex->bucketArray[hash]==0)
+			continue;
+
+		/* Warning: In bucketArray and chainArray we've stored the rowIds relevant to the bucket [i.e: 0 ~> bucketSize-1] */
+
+		k = searchIndex->bucketArray[hash] - 1;
+		checkEqual(small,big,i,start,searchValue,k,results,tupleToInsert);
+
+		while(1)
+		{
+			// We've reached the end of the chain
+			if(searchIndex->chainArray[k] == 0)
+				break;
+
+			/* Step further on the chain */
+			else
+			{
+				k = searchIndex->chainArray[k] - 1;
+				checkEqual(small,big,i,start,searchValue,k,results,tupleToInsert);
+			}
+		}
+
+	}
+	free(tupleToInsert);
+	pthread_mutex_lock(&jobsFinishedMtx);
+	++jobsFinished;
+	pthread_cond_signal(&condJobsFinished);
+	pthread_mutex_unlock(&jobsFinishedMtx);
+}
+
+void checkEqual(RadixHashJoinInfo *small,RadixHashJoinInfo *big,unsigned i,unsigned start,unsigned searchValue,unsigned pseudoRow,struct Vector *results,unsigned *tupleToInsert)
+{
+	uint32_t actualRow;
+	/* We calculate the rowId relevant to the sorted array [i.e: 0 ~> numOfTuples] */
+	actualRow = start + pseudoRow;
+
+	/*
+	 * Check equality and insert tuple into results vector
+	 * The new tuple is constructed by combining the tuple of each relation.
+	 */
+	if(small->sorted->values[actualRow] == searchValue)
+	{
+		constructTuple(small,big,actualRow,i,tupleToInsert);
+		insertAtVector(results,tupleToInsert);
+
+	}
+}
+
+void constructTuple(RadixHashJoinInfo *small,RadixHashJoinInfo *big,unsigned actualRow,unsigned i,unsigned *target)
+{
+	/**
+	 * We need to construct the tuple that we're gonna add in the results vector
+	 *
+	 * First,we add left column's tuple [it is important to add left column's tuple first]
+	 * Then,we add right column's tuple.
+	 *
+	 * Notice that we need to access different row depending on
+	 * whether the column is small or big [i.e: indexed or not]
+	 */
+	unsigned *t;
+	unsigned k=0;
+	RadixHashJoinInfo *left  = small->isLeft ? small : big;
+	RadixHashJoinInfo *right = small->isLeft ? big : small;
+
+	// Add values from left column's tuple
+	if(left->isSmall)
+		t = &left->sorted->tuples->table[actualRow*left->sorted->tuples->tupleSize];
+	else
+		t = &left->sorted->tuples->table[i*left->sorted->tuples->tupleSize];
+
+	for(unsigned i=0;i<left->tupleSize;++i)
+		target[k++] = t[i];
+
+	// Add values from right column's tuple
+	if(right->isSmall)
+		t = &right->sorted->tuples->table[actualRow*right->sorted->tuples->tupleSize];
+	else
+		t = &right->sorted->tuples->table[i*right->sorted->tuples->tupleSize];
+
+	for(unsigned i=0;i<right->tupleSize;++i)
+		target[k++] = t[i];
+}  #include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <string.h>/* strerror() */
+#include <errno.h>/* errno */
+#include <pthread.h>
+
+#include "Partition.h"
+#include "Intermediate.h"
+#include "JobScheduler.h"
+#include "Queue.h"
+#include "Utils.h"
+#include "Vector.h"
+
+#define PARALLEL_PARTITION 0
+#define PARALLEL_HISTOGRAM 0
+
+void histFunc(void* arg)
+{
+  // double elapsed;
+  // struct timespec start, finish;
+  // clock_gettime(CLOCK_MONOTONIC, &start);
+
+	struct histArg *myarg = arg;
+  for(unsigned i=0;i<HASH_RANGE_1;++i){
+    myarg->histogram[i] = 0;
+  }
+  for(unsigned i=myarg->start;i<myarg->end;++i){
+    myarg->histogram[HASH_FUN_1(myarg->values[i])] += 1;
+  }
+  // clock_gettime(CLOCK_MONOTONIC, &finish);
+  // elapsed = (finish.tv_sec - start.tv_sec);
+  // elapsed += (finish.tv_nsec - start.tv_nsec) / 1000000000.0;
+  // fprintf(stderr, "Duration[%u]:%.5lf seconds\n",(unsigned)pthread_self(),elapsed);
+
+  pthread_barrier_wait(&barrier);
+}
+
+void partitionFunc(void* arg)
+{
+  // double elapsed;
+  // struct timespec start, finish;
+  // clock_gettime(CLOCK_MONOTONIC, &start);
+
+	struct partitionArg *myarg = arg;
+	for(unsigned i=myarg->start;i<myarg->end;++i)
+	{
+		/* Get the hashValue from unsorted column */
+		unsigned h;
+		if(myarg->info->isInInter)
+      h = HASH_FUN_1(myarg->info->unsorted->values[i]);
+		else
+      h = HASH_FUN_1(myarg->info->col[i]);
+
+		/* Go to pSumCopy and find where we need to place it in sorted column  */
+		unsigned offset;
+    pthread_mutex_lock(&partitionMtxArray[h]);
+		offset = myarg->pSumCopy[h];
+
+
+		/**
+		* Increment the value to know where to put he next element with the same hashValue
+		*/
+		myarg->pSumCopy[h]++;
+		if(myarg->info->isInInter)
+		{
+			myarg->info->sorted->values[offset] = myarg->info->unsorted->values[i];
+			myarg->info->sorted->rowIds[offset] = myarg->info->unsorted->rowIds[i];
+			insertAtPos(myarg->info->sorted->tuples,&myarg->info->unsorted->tuples->table[i*myarg->info->tupleSize],offset);
+		}
+		else
+		{
+			myarg->info->sorted->values[offset] = myarg->info->col[i];
+			myarg->info->sorted->rowIds[offset] = i;
+			insertAtPos(myarg->info->sorted->tuples,&i,offset);
+		}
+    pthread_mutex_unlock(&partitionMtxArray[h]);
+	}
+  // clock_gettime(CLOCK_MONOTONIC, &finish);
+  // elapsed = (finish.tv_sec - start.tv_sec);
+  // elapsed += (finish.tv_nsec - start.tv_nsec) / 1000000000.0;
+  // fprintf(stderr, "Duration[%u]:%.5lf seconds\n",(unsigned)pthread_self(),elapsed);
+	pthread_barrier_wait(&barrier);
+}
+
+void partition(RadixHashJoinInfo *info)
+{
+	info->unsorted         = malloc(sizeof(ColumnInfo));
+  MALLOC_CHECK(info->unsorted);
+
+  info->unsorted->values = malloc(info->numOfTuples*sizeof(uint64_t));
+  MALLOC_CHECK(info->unsorted->values);
+
+  info->unsorted->rowIds = malloc(info->numOfTuples*sizeof(unsigned));
+  MALLOC_CHECK(info->unsorted->rowIds);
+
+  info->sorted           = malloc(sizeof(ColumnInfo));
+  MALLOC_CHECK(info->sorted);
+
+  info->sorted->values   = malloc(info->numOfTuples*sizeof(uint64_t));
+  MALLOC_CHECK(info->sorted->values);
+
+  info->sorted->rowIds   = malloc(info->numOfTuples*sizeof(unsigned));
+  MALLOC_CHECK(info->sorted->rowIds);
+
+  info->indexArray       = NULL;
+
+  createVectorFixedSize(&info->sorted->tuples,info->tupleSize,info->numOfTuples);
+
+	createVector(&info->unsorted->tuples,info->tupleSize);
+
+	// Get values-rowIds from intermediate vector
+	if(info->isInInter)
+		scanJoin(info);
+
+	// Create our main histogram
+	info->hist = malloc(HASH_RANGE_1*sizeof(unsigned));
+  MALLOC_CHECK(info->hist);
+
+#if PARALLEL_HISTOGRAM
+	// Enqueue histogram jobs
+	unsigned chunkSize = info->numOfTuples / js->threadNum;
+	unsigned lastEnd = 0;
+	unsigned i;
+	for(i=0;i<js->threadNum-1;++i)
+	{
+		struct histArg *arg = js->histJobs[i].argument;
+		arg->start          = i*chunkSize;
+		arg->end            = arg->start + chunkSize;
+		arg->values         = (info->isInInter) ? info->unsorted->values : info->col;
+		pthread_mutex_lock(&queueMtx);
+		enQueue(jobQueue,&js->histJobs[i]);
+		pthread_cond_signal(&condNonEmpty);
+		pthread_mutex_unlock(&queueMtx);
+		lastEnd = arg->end;
+	}
+	// Remaining values, in case numOfTuples could not be divided exactly between the threads
+	struct histArg *arg = js->histJobs[i].argument;
+	arg->start          = lastEnd;
+	arg->end            = info->numOfTuples;
+	arg->values         = (info->isInInter) ? info->unsorted->values : info->col;
+	pthread_mutex_lock(&queueMtx);
+	enQueue(jobQueue,&js->histJobs[i]);
+	pthread_cond_signal(&condNonEmpty);
+	pthread_mutex_unlock(&queueMtx);
+
+	// Wait until all threads are done
+  // fprintf(stderr, "%s\n","Before barrier" );
+	pthread_barrier_wait(&barrier);
+  // fprintf(stderr, "%s\n","After barrier" );
+
+
+	// Merge the partial histograms
+	for(unsigned i=0;i<HASH_RANGE_1;++i)
+		info->hist[i] = 0;
+
+	for(unsigned t=0;t<js->threadNum;++t)
+		for(unsigned h=0;h<HASH_RANGE_1;++h)
+			info->hist[h]+=js->histArray[t][h];
+#else
+
+  for(unsigned i=0;i<HASH_RANGE_1;++i)
+    info->hist[i] = 0;
+
+  for(unsigned i=0;i<info->numOfTuples;++i)
+    if(info->isInInter)
+    	info->hist[HASH_FUN_1(info->unsorted->values[i])] += 1;
+    else
+    	info->hist[HASH_FUN_1(info->col[i])] += 1;
+#endif
+
+  // Calculate Prefix Sum
+	unsigned sum = 0;
+	info->pSum   = malloc(HASH_RANGE_1*sizeof(unsigned));
+  MALLOC_CHECK(info->pSum);
+
+	for(unsigned i=0;i<HASH_RANGE_1;++i)
+		info->pSum[i] = 0;
+
+	for(unsigned i=0;i<HASH_RANGE_1;++i)
+	{
+		info->pSum[i] = sum;
+		sum += info->hist[i];
+	}
+
+  unsigned *pSumCopy   = malloc(HASH_RANGE_1*sizeof(unsigned));
+  MALLOC_CHECK(pSumCopy);
+  for(unsigned i=0;i<HASH_RANGE_1;++i)
+    pSumCopy[i] = info->pSum[i];
+
+#if PARALLEL_PARTITION
+	lastEnd = 0;
+	for(i=0;i<js->threadNum-1;++i)
+	{
+		struct partitionArg *arg = js->partitionJobs[i].argument;
+		arg->start               = i*chunkSize;
+		arg->end                 = arg->start + chunkSize;
+    arg->pSumCopy            = pSumCopy;
+    arg->info                = info;
+		pthread_mutex_lock(&queueMtx);
+		enQueue(jobQueue,&js->partitionJobs[i]);
+		pthread_cond_signal(&condNonEmpty);
+		pthread_mutex_unlock(&queueMtx);
+		lastEnd = arg->end;
+	}
+	// Remaining values, in case numOfTuples could not be divided exactly between the threads
+  struct partitionArg *pArg = js->partitionJobs[i].argument;
+  pArg->start               = lastEnd;
+	pArg->end                 = info->numOfTuples;
+  pArg->pSumCopy            = pSumCopy;
+  pArg->info                = info;
+	pthread_mutex_lock(&queueMtx);
+	enQueue(jobQueue,&js->partitionJobs[i]);
+	pthread_cond_signal(&condNonEmpty);
+	pthread_mutex_unlock(&queueMtx);
+
+	// Wait until all threads are done
+  // fprintf(stderr, "%s\n","Before barrier" );
+	pthread_barrier_wait(&barrier);
+  // fprintf(stderr, "%s\n","After barrier" );
+#else
+
+  for(unsigned i=0;i<info->numOfTuples;++i)
+	{
+		/* Get the hashValue from unsorted column */
+		unsigned h;
+		if(info->isInInter)
+			h = HASH_FUN_1(info->unsorted->values[i]);
+		else
+			h = HASH_FUN_1(info->col[i]);
+
+		/* Go to pSumCopy and find where we need to place it in sorted column  */
+		unsigned offset;
+		offset = pSumCopy[h];
+
+		/**
+		 * Increment the value to know where to put he next element with the same hashValue
+		 * With this we lose the original representation of pSum
+		 * If we want to have access we must create a acopy before entering this for loop
+		 */
+		pSumCopy[h]++;
+		if(info->isInInter)
+		{
+			info->sorted->values[offset] = info->unsorted->values[i];
+			info->sorted->rowIds[offset] = info->unsorted->rowIds[i];
+			insertAtPos(info->sorted->tuples,&info->unsorted->tuples->table[i*info->tupleSize],offset);
+		}
+		else
+		{
+			info->sorted->values[offset] = info->col[i];
+			info->sorted->rowIds[offset] = i;
+			insertAtPos(info->sorted->tuples,&i,offset);
+		}
+	}
+#endif
+  free(pSumCopy);
+}  #include <stdio.h>
+#include <stdlib.h>
+#include <string.h> /*strtok(),strcpy()*/
+
+#include "Parser.h"
+#include "Utils.h"
+#include "Relation.h"
+#include "Optimizer.h"
+
+
+void createQueryEstimations(struct QueryInfo *qInfo,struct Joiner *j)
+{
+	qInfo->estimations = malloc(qInfo->numOfRelationIds*sizeof(struct columnStats*));
+	MALLOC_CHECK(qInfo->estimations);
+	for(unsigned i=0;i<qInfo->numOfRelationIds;++i)
+	{
+		unsigned relId = qInfo->relationIds[i];
+		unsigned size = j->relations[relId]->numOfCols*sizeof(struct columnStats);
+
+		// Allocate space to store the estimations
+		qInfo->estimations[i] = malloc(size);
+		MALLOC_CHECK(qInfo->estimations[i]);
+		// Fetch the stats, calculated when the relations were being loaded in memory
+		memcpy(qInfo->estimations[i],j->relations[relId]->stats,size);
+	}
+}
+
+void createQueryInfo(struct QueryInfo **qInfo,char *rawQuery)
+{
+	*qInfo = malloc(sizeof(struct QueryInfo));
+	MALLOC_CHECK(*qInfo);
+	(*qInfo)->estimations = NULL;
+	parseQuery(*qInfo,rawQuery);
+}
+
+void destroyQueryInfo(struct QueryInfo *qInfo)
+{
+	free(qInfo->relationIds);
+	free(qInfo->predicates);
+	free(qInfo->filters);
+	free(qInfo->selections);
+	if(qInfo->estimations)/* Useful in unit testing */
+		for(unsigned i=0;i<qInfo->numOfRelationIds;++i)
+			free(qInfo->estimations[i]);
+	free(qInfo->estimations);
+	free(qInfo);
+}
+
+void parseQuery(struct QueryInfo *qInfo,char *rawQuery)
+{
+	char rawRelations[BUFFERSIZE];
+	char rawPredicates[BUFFERSIZE];
+	char rawSelections[BUFFERSIZE];
+
+	/* Split query into three parts */
+	if( (sscanf(rawQuery,"%[^|]|%[^|]|%[^|]",rawRelations,rawPredicates,rawSelections)) != 3 )
+	{
+		fprintf(stderr,"Query \"%s\" does not consist of three parts\nExiting...\n\n",rawQuery);
+		exit(EXIT_FAILURE);
+	}
+
+	/* Parse each part */
+	parseRelationIds(qInfo,rawRelations);
+	parsePredicates(qInfo,rawPredicates);
+	parseSelections(qInfo,rawSelections);
+}
+
+void parseRelationIds(struct QueryInfo *qInfo,char *rawRelations)
+{
+	char* temp = rawRelations;
+	unsigned i;
+	int offset;
+
+	/* Get number of relationIds */
+	qInfo->numOfRelationIds = 0;
+	while(sscanf(temp,"%*d%n",&offset)>=0)
+	{
+		++qInfo->numOfRelationIds;
+		temp+=offset;
+	}
+	if(!qInfo->numOfRelationIds)
+	{
+		fprintf(stderr,"Zero join relations were found in the query\nExiting...\n\n");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Allocate memory for relationIds */
+	qInfo->relationIds = malloc(qInfo->numOfRelationIds*sizeof(unsigned));
+	MALLOC_CHECK(qInfo->relationIds);
+
+	/* Store relationIds */
+	temp = rawRelations;
+	i=0;
+	while(sscanf(temp,"%u%n",&qInfo->relationIds[i],&offset)>0)
+	{
+		++i;
+		temp+=offset;
+	}
+}
+
+void parseSelections(struct QueryInfo *qInfo,char *rawSelections)
+{
+
+	char* temp = rawSelections;
+	unsigned relId,colId,i;
+	int offset;
+
+	/* Get number of selections */
+	qInfo->numOfSelections = 0;
+	while(sscanf(temp,"%*u.%*u%n",&offset)>=0)
+	{
+		++qInfo->numOfSelections;
+		temp+=offset;
+	}
+	if(!qInfo->numOfSelections)
+	{
+		fprintf(stderr,"Zero selections were found in the query\nExiting...\n\n");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Allocate memory for selections */
+	qInfo->selections = malloc(qInfo->numOfSelections*sizeof(struct SelectInfo));
+	MALLOC_CHECK(qInfo->selections);
+
+	/*  Store selections */
+	temp = rawSelections;
+	i=0;
+	while(sscanf(temp,"%u.%u%n",&relId,&colId,&offset)>0)
+	{
+		qInfo->selections[i].relId = relId;
+		qInfo->selections[i].colId = colId;
+		++i;
+		temp+=offset;
+	}
+}
+
+void parsePredicates(struct QueryInfo *qInfo,char *rawPredicates)
+{
+	unsigned i,j;
+	char *token;
+	char *temp = malloc((strlen(rawPredicates)+1)*sizeof(char));
+	MALLOC_CHECK(temp);
+	strcpy(temp,rawPredicates);
+
+	/* Get number of predicates and filters */
+	qInfo->numOfFilters    = 0;
+	qInfo->numOfPredicates = 0;
+	token = strtok(temp,"&");
+	if(isFilter(token))
+		++qInfo->numOfFilters;
+	else
+		++qInfo->numOfPredicates;
+	while(token=strtok(NULL,"&"))
+		if(isFilter(token))
+			++qInfo->numOfFilters;
+		else
+			++qInfo->numOfPredicates;
+
+	if(!(qInfo->numOfPredicates+qInfo->numOfFilters))
+	{
+		fprintf(stderr,"Zero predicates were found in the query\nExiting...\n\n");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Allocate memory for predicates and filters */
+	qInfo->predicates = malloc(qInfo->numOfPredicates*sizeof(struct PredicateInfo));
+	MALLOC_CHECK(qInfo->predicates);
+	qInfo->filters    = malloc(qInfo->numOfFilters*sizeof(struct FilterInfo));
+	MALLOC_CHECK(qInfo->filters);
+
+	/* Store predicates & filters */
+	strcpy(temp,rawPredicates);
+	token = strtok(temp,"&");
+	i=j=0;
+	if(isFilter(token))
+		{addFilter(&qInfo->filters[i],token);++i;}
+	else
+		{addPredicate(&qInfo->predicates[j],token);++j;}
+
+
+	while(token=strtok(NULL,"&"))
+		if(isFilter(token))
+			{addFilter(&qInfo->filters[i],token);++i;}
+		else
+			{addPredicate(&qInfo->predicates[j],token);++j;}
+
+	free(temp);
+}
+
+void addFilter(struct FilterInfo *fInfo,char *token)
+{
+	unsigned relId;
+	unsigned colId;
+	char cmp;
+	uint64_t constant;
+	sscanf(token,"%u.%u%c%lu",&relId,&colId,&cmp,&constant);
+	// printf("\"%u.%u%c%lu\"\n",relId,colId,cmp,constant);
+	fInfo->filterLhs.relId = relId;
+	fInfo->filterLhs.colId = colId;
+	fInfo->comparison      = cmp;
+	fInfo->constant        = constant;
+}
+
+void addPredicate(struct PredicateInfo *pInfo,char *token)
+{
+	unsigned relId1;
+	unsigned colId1;
+	unsigned relId2;
+	unsigned colId2;
+	sscanf(token,"%u.%u=%u.%u",&relId1,&colId1,&relId2,&colId2);
+	// printf("\"%u.%u=%u.%u\"\n",relId1,colId1,relId2,colId2);
+	pInfo->left.relId  = relId1;
+	pInfo->left.colId  = colId1;
+	pInfo->right.relId = relId2;
+	pInfo->right.colId = colId2;
+}
+
+int isFilter(char *predicate)
+{
+	char constant[20];
+	sscanf(predicate,"%*u.%*u%*[=<>]%s",constant);
+
+	if(!strstr(constant,"."))
+		return 1;
+	else
+		return 0;
+}
+
+int isColEquality(struct PredicateInfo *pInfo)
+{return (pInfo->left.relId == pInfo->right.relId); }
+
+unsigned getRelId(struct SelectInfo *sInfo)
+{return sInfo->relId;}
+
+unsigned getOriginalRelId(struct QueryInfo *qInfo,struct SelectInfo *sInfo)
+{return qInfo->relationIds[sInfo->relId];}
+
+unsigned getColId(struct SelectInfo *sInfo)
+{return sInfo->colId;}
+
+uint64_t getConstant(struct FilterInfo *fInfo)
+{return fInfo->constant;}
+
+Comparison getComparison(struct FilterInfo *fInfo)
+{return fInfo->comparison;}
+
+unsigned getNumOfFilters(struct QueryInfo *qInfo)
+{return qInfo->numOfFilters;}
+
+unsigned getNumOfRelations(struct QueryInfo *qInfo)
+{return qInfo->numOfRelationIds;}
+
+unsigned getNumOfColEqualities(struct QueryInfo *qInfo)
+{
+	unsigned sum=0;
+	for(unsigned i=0;i<qInfo->numOfPredicates;++i)
+		if(isColEquality(&qInfo->predicates[i]))
+			++sum;
+	return sum;
+}
+
+unsigned getNumOfJoins(struct QueryInfo *qInfo)
+{
+	unsigned sum=0;
+	for(unsigned i=0;i<qInfo->numOfPredicates;++i)
+		if(!isColEquality(&qInfo->predicates[i]))
+			++sum;
+	return sum;
+}
+
+/**************************** For Testing... ***************************************/
+void printTest(struct QueryInfo *qInfo)
+{
+	for(unsigned j=0;j<qInfo->numOfRelationIds;++j)
+	{
+		fprintf(stderr,"%u ",qInfo->relationIds[j]);
+	}
+	fprintf(stderr,"|");
+	for(unsigned j=0;j<qInfo->numOfPredicates;++j)
+	{
+		unsigned leftRelId  = getRelId(&qInfo->predicates[j].left);
+		unsigned rightRelId = getRelId(&qInfo->predicates[j].right);
+		unsigned leftColId  = getColId(&qInfo->predicates[j].left);
+		unsigned rightColId = getColId(&qInfo->predicates[j].right);
+
+		if(isColEquality(&qInfo->predicates[j]))
+			fprintf(stderr,"[%u.%u=%u.%u] & ",leftRelId,leftColId,rightRelId,rightColId);
+		else
+			fprintf(stderr,"%u.%u=%u.%u & ",leftRelId,leftColId,rightRelId,rightColId);
+	}
+	for(unsigned j=0;j<qInfo->numOfFilters;++j)
+	{
+		unsigned relId    = getRelId(&qInfo->filters[j].filterLhs);
+		unsigned colId    = getColId(&qInfo->filters[j].filterLhs);
+		Comparison cmp    = getComparison(&qInfo->filters[j]);
+		uint64_t constant = getConstant(&qInfo->filters[j]);
+
+		fprintf(stderr,"%u.%u%c%ld & ",relId,colId,cmp,constant);
+	}
+	fprintf(stderr,"|");
+	for(unsigned j=0;j<qInfo->numOfSelections;++j)
+	{
+		unsigned relId = getRelId(&qInfo->selections[j]);
+		unsigned colId = getColId(&qInfo->selections[j]);
+		fprintf(stderr,"%u.%u ",relId,colId);
+	}
+	fprintf(stderr, "\n");
+}  #include <stdio.h>
+#include <stdlib.h>
+#include "Optimizer.h"
+#include "Utils.h"
+#include "Parser.h"
+#include "Joiner.h"
+#include "Relation.h"
+
+void findStats(uint64_t *column, struct columnStats *stat, unsigned columnSize)
+{
+	/* Find MIN and MAX */
+	uint64_t min = column[0];
+	uint64_t max = column[0];
+	for (unsigned i = 1; i < columnSize; ++i)
+	{
+		if (column[i] > max)
+			max = column[i];
+		if (column[i] < min)
+			min = column[i];
+	}
+
+	/* Find discrete values */
+	unsigned nbits  = (max - min + 1 > PRIMELIMIT) ? PRIMELIMIT : max - min + 1;
+	stat->bitVector = calloc(BITNSLOTS(nbits),CHAR_BIT);
+	MALLOC_CHECK(stat->bitVector);
+	stat->discreteValues = 0;
+
+
+	/* Find the way to fill the boolean array depending on its size relative to PRIMELIMIT */
+	if (nbits != PRIMELIMIT)
+	{
+		stat->typeOfBitVector = 0;
+		for (unsigned i = 0; i < columnSize; ++i)
+		{
+			if(BITTEST(stat->bitVector,column[i]-min) == 0)
+				(stat->discreteValues)++;
+			BITSET(stat->bitVector,column[i]-min);
+		}
+	}
+	else
+	{
+		stat->typeOfBitVector = 1;
+		for (unsigned i = 0; i < columnSize; ++i)
+		{
+			if(BITTEST(stat->bitVector,(column[i]-min) % PRIMELIMIT) == 0)
+				(stat->discreteValues)++;
+			BITSET(stat->bitVector,(column[i]-min) % PRIMELIMIT);
+		}
+	}
+	/* Assign the remaining values to the stats*/
+	stat->minValue      = min;
+	stat->maxValue      = max;
+	stat->f             = columnSize;
+	stat->bitVectorSize = nbits;
+}
+
+void applyColEqualityEstimations(struct QueryInfo *q, struct Joiner *j)
+{
+	for(unsigned i = 0 ; i < q->numOfPredicates; ++i)
+	{
+		unsigned leftRelId        = getRelId(&q->predicates[i].left);
+		unsigned rightRelId       = getRelId(&q->predicates[i].right);
+		unsigned leftColId        = getColId(&q->predicates[i].left);
+		unsigned rightColId       = getColId(&q->predicates[i].right);
+		unsigned actualId         = getOriginalRelId(q, &q->predicates[i].left);
+		struct columnStats *stat1 = &q->estimations[leftRelId][leftColId];
+		struct columnStats *stat2 = &q->estimations[rightRelId][rightColId];
+		struct columnStats *temp;
+
+		// Same relation - different columns
+		if(isColEquality(&q->predicates[i]) && (leftColId != rightColId))
+		{
+			// fprintf(stderr,"%u.%u=%u.%u & ",leftRelId,leftColId,rightRelId,rightColId);
+			// Find estimations for the two columns
+			uint64_t newMin;
+			uint64_t newMax;
+			unsigned newF;
+			unsigned newD;
+
+			// fprintf(stderr, "stat1: %lu ~~> %lu\n",stat1->minValue,stat1->maxValue);
+			// fprintf(stderr, "stat2: %lu ~~> %lu\n",stat2->minValue,stat2->maxValue);
+
+			newMin = (stat1->minValue > stat2->minValue) ? stat1->minValue : stat2->minValue;
+			newMax = (stat1->maxValue < stat2->maxValue) ? stat1->maxValue : stat2->maxValue;
+			newF   = stat1->f / (newMax - newMin + 1);
+			newD   = stat1->discreteValues * (1-power(1-(newF/stat1->f),stat1->f/stat1->discreteValues));
+
+			/* Update the statistics of every other column except for the ones taking part in the equality  */
+			/* Note: Number of columns of every relation is stored in joiner, thus we need joiner to access it */
+			for (unsigned c = 0; c < (*(j->relations[actualId])).numOfCols; ++c)
+			{
+				/* leftRelId and rightRelId are the same, so we could also use rightRelId */
+				temp = &q->estimations[leftRelId][c];
+				if ((c!=leftColId)  && (c!=rightColId))
+				{
+					/* In case stat1->f or temp->discreteValues is zero */
+					stat1->f = (stat1->f == 0) ? 1 : stat1->f;
+					temp->discreteValues = (temp->discreteValues == 0) ? 1 : temp->discreteValues;
+
+					temp->discreteValues = temp->discreteValues * (1-power(1-(newF/stat1->f),temp->f/temp->discreteValues));
+				}
+			}
+
+			/* Update the statistics for the two columns taking part in the equality */
+			stat1->minValue       = stat2->minValue       = newMin;
+			stat1->maxValue       = stat2->maxValue       = newMax;
+			stat1->f              = stat2->f              = newF;
+			stat1->discreteValues = stat2->discreteValues = newD;
+			// printColumnStats(&q->estimations[leftRelId][1]);
+		}
+		// Same relation - same column
+		else if(isColEquality(&q->predicates[i]))
+		{
+			stat1->f = (stat1->f * stat1->f) / (stat1->maxValue - stat1->minValue + 1);
+			for (unsigned c = 0; c < (*(j->relations[actualId])).numOfCols; ++c)
+			{
+				/* leftRelId and rightRelId are the same, so we could also use rightRelId */
+				/* nothing changes in this case,apart from "f" */
+				temp = &q->estimations[leftRelId][c];
+				if (c!=rightColId)
+					temp->f = stat1->f;
+			}
+		}
+	}
+}
+
+void applyFilterEstimations(struct QueryInfo *q, struct Joiner *j)
+{
+
+	for(unsigned i = 0 ; i < q->numOfFilters; ++i)
+	{
+		unsigned relId           = getRelId(&q->filters[i].filterLhs);
+		unsigned colId           = getColId(&q->filters[i].filterLhs);
+		Comparison cmp           = getComparison(&q->filters[i]);
+		uint64_t constant        = getConstant(&q->filters[i]);
+		unsigned actualRelId     = getOriginalRelId(q, &q->filters[i].filterLhs);
+		struct columnStats *stat = &q->estimations[relId][colId];
+
+		// fprintf(stderr, "%s\n", "::::::::::::::::::::::::::::::::::::::::::::::::::");
+		// fprintf(stderr,"%u.%u%c%ld",relId,colId,cmp,constant);
+		// fprintf(stderr, "\n%s\n", "::::::::::::::::::::::::::::::::::::::::::::::::::");
+
+		// printColumnStats(&q->estimations[relId][colId]);
+
+		// fprintf(stderr, "\n\n");
+		filterEstimation(j,q,colId,stat,actualRelId,relId,cmp,constant);
+
+		// printColumnStats(&q->estimations[relId][colId]);
+	}
+}
+
+void applyJoinEstimations(struct QueryInfo *q, struct Joiner *j)
+{
+
+	/* Find stats for columns in predicates */
+	for(unsigned i=0;i<q->numOfPredicates;++i)
+	{
+		unsigned leftRelId            = getRelId(&q->predicates[i].left);
+		unsigned rightRelId           = getRelId(&q->predicates[i].right);
+		unsigned leftColId            = getColId(&q->predicates[i].left);
+		unsigned rightColId           = getColId(&q->predicates[i].right);
+		unsigned actualRelIdLeft      = getOriginalRelId(q, &q->predicates[i].left);
+		unsigned actualRelIdRight     = getOriginalRelId(q, &q->predicates[i].right);
+		struct columnStats *statLeft  = &q->estimations[leftRelId][leftColId];
+		struct columnStats *statRight = &q->estimations[rightRelId][rightColId];
+		struct columnStats *temp;
+
+		// Join between different relations
+		if(!isColEquality(&q->predicates[i]))
+		{
+			// fprintf(stderr,"%u.%u=%u.%u &\n",leftRelId,leftColId,rightRelId,rightColId);
+
+			/* We'll need them for updating every other column of the relations */
+			unsigned oldDiscreteLeft  = statLeft->discreteValues;
+			unsigned oldDiscreteRight = statRight->discreteValues;
+
+			uint64_t max,min;
+			min = (statLeft->minValue > statRight->minValue) ? statLeft->minValue : statRight->minValue;
+			max = (statLeft->maxValue < statRight->maxValue) ? statLeft->maxValue : statRight->maxValue;
+
+			// printColumnStats(statLeft);
+			// printColumnStats(statRight);
+
+			/* Implicit filter for min value */
+			filterEstimation(j,q,leftColId,statLeft,actualRelIdLeft,leftRelId,'>',min);
+			filterEstimation(j,q,rightColId,statRight,actualRelIdRight,rightRelId,'>',min);
+
+			/* Implicit filter for max value */
+			filterEstimation(j,q,leftColId,statLeft,actualRelIdLeft,leftRelId,'<',max);
+			filterEstimation(j,q,rightColId,statRight,actualRelIdRight,rightRelId,'<',max);
+
+			statLeft->f              = statRight->f              = (statLeft->f * statRight->f)/(max-min+1);
+			statLeft->minValue       = statRight->minValue       = min;
+			statLeft->maxValue       = statRight->maxValue       = max;
+			statLeft->discreteValues = statRight->discreteValues = (statLeft->discreteValues*statRight->discreteValues)/(max-min+1);
+
+			/* Update the statistics of every other column of the left relation */
+			for (unsigned c = 0; c < (*(j->relations[actualRelIdLeft])).numOfCols; ++c)
+			{
+				temp = &q->estimations[leftRelId][c];
+				if (c != leftColId)
+				{
+					oldDiscreteLeft = (oldDiscreteLeft == 0) ? 1 : oldDiscreteLeft;
+					temp->discreteValues = (temp->discreteValues == 0) ? 1 : temp->discreteValues;
+
+					temp->f = statLeft->f;
+					temp->discreteValues =
+					temp->discreteValues * (1-power(1-(statLeft->discreteValues/oldDiscreteLeft),(temp->f/temp->discreteValues)));
+				}
+			}
+			/* Update the statistics of every other column of the right relation */
+			for (unsigned c = 0; c < (*(j->relations[actualRelIdRight])).numOfCols; ++c)
+			{
+				temp = &q->estimations[rightRelId][c];
+				if (c != rightColId)
+				{
+					oldDiscreteRight = (oldDiscreteRight == 0) ? 1 : oldDiscreteRight;
+					temp->discreteValues = (temp->discreteValues == 0) ? 1 : temp->discreteValues;
+
+					temp->f = statLeft->f;
+					temp->discreteValues =
+					temp->discreteValues * (1-power(1-(statRight->discreteValues/oldDiscreteRight),(temp->f/temp->discreteValues)));
+				}
+			}
+			// printColumnStats(statLeft);
+			// printColumnStats(statRight);
+		}
+	}
+	// fprintf(stderr, "\n");
+}
+
+void filterEstimation(struct Joiner *j,struct QueryInfo *q,unsigned colId,struct columnStats *stat,unsigned actualRelId,unsigned relId,Comparison cmp,uint64_t constant)
+{
+	struct columnStats *temp;
+	uint64_t fTemp = stat->f;
+	char isInArray = 0;
+
+	if (cmp == '=')
+	{
+
+		/* Find if constant is in the discrete values */
+		/* If constant is not in the range of values of the column we won't find it in the bitVector */
+		if ( (constant < stat->minValue) ||  (constant > stat->maxValue) )
+		isInArray = 0;
+		/* If the value in the bitVector is 1 then the constant is in the bitVector */
+		else
+		{
+			/* Make sure we use the correct way to find if it is in the bitVector */
+			if (stat->typeOfBitVector == 0)
+			{
+				// fprintf(stderr, "%u\n",BITTEST(stat->bitVector,522 - stat->minValue));
+				if (BITTEST(stat->bitVector,constant - stat->minValue) != 0)
+				{
+					isInArray = 1;
+				}
+			}
+			else if (stat->typeOfBitVector == 1)
+			{
+				if(BITTEST(stat->bitVector,(constant - stat->minValue) % PRIMELIMIT) != 0)
+				isInArray = 1;
+			}
+		}
+
+		/* Change the statistics  of the column */
+		stat->minValue = constant;
+		stat->maxValue = constant;
+		if (isInArray == 0)
+		{
+			stat->f = 0;
+			stat->discreteValues = 0;
+		}
+		else
+		{
+			stat->f = stat->f / stat->discreteValues;
+			stat->discreteValues = 1;
+		}
+	}
+	else
+	{
+
+		/* cmp is '>' or '<' */
+		/* lowerLimit */
+		uint64_t k1 = (cmp == '>') ?  constant + 1 : stat->minValue ;
+		/* upperLimit */
+		uint64_t k2 = (cmp == '<') ?  constant - 1 : stat->maxValue;
+
+		if (k1 < stat->minValue)
+		k1 = stat->minValue;
+
+		if (k2 > stat->maxValue)
+		k2 = stat->maxValue;
+
+		/* If factor is in (0,1],round it up to 1 */
+			double factor = (double)(k2 - k1) / (stat->maxValue - stat->minValue);
+			if((factor <= 1)  && (factor > 0))
+			factor = 1;
+
+			// fprintf(stderr, "k1:%lu | k2:%lu\n\n",k1,k2);
+			// fprintf(stderr, "minPrev:%lu | maxPrev:%lu\n",stat->minValue,stat->maxValue);
+			// fprintf(stderr, "Factor:%.3lf\n",factor);
+
+			/* Change the statistics  of the column */
+			if(stat->maxValue - stat->minValue > 0)
+			{
+				stat->discreteValues = factor * stat->discreteValues;
+				stat->f              = factor * stat->f;
+			}
+			else
+			/* In case of: R.A<CONSTANT & R.A>CONSTANT */
+			stat->discreteValues = stat->f  = 0 ;
+
+			stat->minValue = k1;
+			stat->maxValue = k2;
+		}
+
+		/* Update the statistics of every other column
+		The formulas are the same for every filter */
+		for (unsigned c = 0; c < (*(j->relations[actualRelId])).numOfCols; ++c)
+		{
+			temp = &q->estimations[relId][c];
+			/* Make sure we update every other column , except the one that we just applied the filter estimations  */
+			if (c != colId)
+			{
+				/* In case fTemp or temp->discreteValues is zero */
+				fTemp = (fTemp == 0) ? 1 : fTemp;
+				temp->discreteValues = (temp->discreteValues == 0) ? 1 : temp->discreteValues;
+
+				temp->discreteValues = temp->discreteValues * (1 -
+					power(1 - (1 - stat->f / fTemp),
+					temp->f / temp->discreteValues));
+					temp->f = stat->f;
+				}
+			}
+		}
+
+
+void findOptimalJoinOrder(struct QueryInfo *q, struct Joiner *j)
+{
+	// Holds the number of each join predicate and its cost
+	// unsigned *costArray = malloc(2*q->numOfPredicates*sizeof(unsigned));
+	// MALLOC_CHECK(costArray);
+	// for(unsigned i=0;i<q->numOfPredicates;++i)
+	// {
+	// 	if(!isColEquality(&q->predicates[i]))
+	// 	{
+	// 		unsigned leftRelId            = getRelId(&q->predicates[i].left);
+	// 		unsigned rightRelId           = getRelId(&q->predicates[i].right);
+	// 		unsigned leftColId            = getColId(&q->predicates[i].left);
+	// 		unsigned rightColId           = getColId(&q->predicates[i].right);
+	// 		unsigned actualRelIdLeft      = getOriginalRelId(q, &q->predicates[i].left);
+	// 		unsigned actualRelIdRight     = getOriginalRelId(q, &q->predicates[i].right);
+	// 		struct columnStats *statLeft  = &q->estimations[leftRelId][leftColId];
+	// 		struct columnStats *statRight = &q->estimations[rightRelId][rightColId];
+	// 		costArray[i]   = i;
+	// 		costArray[i+1] = statLeft->f*statRight->f;
+	// 		fprintf(stderr, "Cost[%u]:%u\n",i,costArray[i+1]);
+	// 	}
+	// }
+	// // Sort in ascending order
+	// quickSort(costArray,0,2*q->numOfPredicates-1);
+	// fprintf(stderr, "\n\n");
+}
+
+
+void printColumnStats(struct columnStats *s)
+{
+	fprintf(stderr, "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n");
+	fprintf(stderr, "minValue: %lu\n", s->minValue);
+	fprintf(stderr, "maxValue: %lu\n", s->maxValue);
+	fprintf(stderr, "f: %u\n", s->f);
+	fprintf(stderr, "discreteValues: %u\n", s->discreteValues);
+	// fprintf(stderr, "Type of boolean array is: %d\n", s->typeOfBitVector);
+	fprintf(stderr, "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n");
+} #include <stdio.h>
+#include <stdlib.h>/*free()*/
+#include <pthread.h>
+#include "Operations.h"
+
+#include "Joiner.h"
+#include "Vector.h"
+#include "Intermediate.h"
+#include "Utils.h"
+#include "Partition.h"
+#include "Build.h"
+#include "Probe.h"
+#include "JobScheduler.h"
+#include "Queue.h"
+
+void colEquality(uint64_t *leftCol,uint64_t *rightCol,unsigned numOfTuples,struct Vector **vector)
+{
+
+	/* Create the vectors that will hold the results */
+	/* 1 stands for: "1 rowId per tuple"  */
+	for(unsigned i=0;i<HASH_RANGE_1;++i)
+		createVector(vector+i,1);
+
+	/* We could have splitted the whole job into HASH_RANGE_1 partial jobs */
+	/* Nahh,it did not give us any speedup. Thus, just let the master thread to do it
+	and save the result in 0-th vector. Rest vectors will be empty */
+
+	for(unsigned i=0;i<numOfTuples;++i)
+		if(leftCol[i]==rightCol[i])
+			insertAtVector(*vector,&i);
+}
+
+void colEqualityInter(uint64_t *leftCol,uint64_t *rightCol,unsigned posLeft,unsigned posRight,struct Vector **vector)
+{
+	struct Vector **results;
+	jobsFinished=0;
+	results = malloc(HASH_RANGE_1*sizeof(struct Vector*));
+	MALLOC_CHECK(results);
+	for(unsigned i=0;i<HASH_RANGE_1;++i)
+		createVector(results+i,getTupleSize(vector[0]));
+
+	for(unsigned i=0;i<HASH_RANGE_1;++i){
+		struct colEqualityArg *arg = js->colEqualityJobs[i].argument;
+		arg->new                   = results[i];
+		arg->old                   = vector[i];
+		arg->leftCol               = leftCol;
+		arg->rightCol              = rightCol;
+		arg->posLeft               = posLeft;
+		arg->posRight              = posRight;
+		pthread_mutex_lock(&queueMtx);
+		enQueue(jobQueue,&js->colEqualityJobs[i]);
+		pthread_cond_signal(&condNonEmpty);
+		pthread_mutex_unlock(&queueMtx);
+	}
+	pthread_mutex_lock(&jobsFinishedMtx);
+	while (jobsFinished!=HASH_RANGE_1) {
+		pthread_cond_wait(&condJobsFinished,&jobsFinishedMtx);
+	}
+	jobsFinished = 0;
+	pthread_cond_signal(&condJobsFinished);
+	pthread_mutex_unlock(&jobsFinishedMtx);
+	for(unsigned i=0;i<HASH_RANGE_1;++i)
+		destroyVector(vector+i);
+
+	for(unsigned i=0;i<HASH_RANGE_1;++i){
+		vector[i] = results[i];
+	}
+	free(results);
+}
+
+void filterFunc(void *arg){
+	struct filterArg *myarg = arg;
+	createVector(myarg->vector,1);
+	for(unsigned i=myarg->start;i<myarg->end;++i)
+		if(compare(myarg->col[i],myarg->cmp,myarg->constant))
+			insertAtVector(*myarg->vector,&i);
+	pthread_mutex_lock(&jobsFinishedMtx);
+	++jobsFinished;
+	pthread_cond_signal(&condJobsFinished);
+	pthread_mutex_unlock(&jobsFinishedMtx);
+}
+
+void filterInter(uint64_t *col,Comparison cmp,uint64_t constant,struct Vector **vector)
+{
+	/* Hold the old vector */
+	struct Vector *old = *vector;
+
+	/* Create a new vector */
+	createVector(vector,1);
+
+	/* Fill the new one appropriately by scanning the old vector */
+	scanFilter(*vector,old,col,cmp,constant);
+
+	/* Destroy the old */
+	destroyVector(&old);
+}
+
+void joinNonInterNonInter(struct InterMetaData *inter,RadixHashJoinInfo* left,RadixHashJoinInfo* right)
+{
+	// Partition the two columns
+	partition(left);
+	partition(right);
+
+	// Build index (for the smallest one)
+	build(left,right);
+	left->isLeft  = 1;
+	right->isLeft = 0;
+
+	// Probe
+	struct Vector **results;
+	results = malloc(HASH_RANGE_1*sizeof(struct Vector*));
+	MALLOC_CHECK(results);
+	for(unsigned i=0;i<HASH_RANGE_1;++i)
+		createVector(results+i,left->tupleSize+right->tupleSize);
+
+	for(unsigned i=0;i<HASH_RANGE_1;++i){
+		struct joinArg *arg = js->joinJobs[i].argument;
+		arg->bucket         = i;
+		arg->left           = left;
+		arg->right          = right;
+		arg->results        = results[i];
+		pthread_mutex_lock(&queueMtx);
+		enQueue(jobQueue,&js->joinJobs[i]);
+		pthread_cond_signal(&condNonEmpty);
+		pthread_mutex_unlock(&queueMtx);
+	}
+	pthread_mutex_lock(&jobsFinishedMtx);
+	while (jobsFinished!=HASH_RANGE_1) {
+		pthread_cond_wait(&condJobsFinished,&jobsFinishedMtx);
+	}
+	jobsFinished = 0;
+	pthread_cond_signal(&condJobsFinished);
+	pthread_mutex_unlock(&jobsFinishedMtx);
+
+	// Update mapRels and interResults //
+	// Construct new mapping
+	unsigned *newMap = malloc(inter->queryRelations*sizeof(unsigned));
+	MALLOC_CHECK(newMap);
+	for(unsigned i=0;i<inter->queryRelations;++i)
+		newMap[i] = -1;
+
+	newMap[left->relId]  = 0;
+	newMap[right->relId] = 1;
+
+	// Free the old map arrays | Destroy the old vectors
+	free(*left->ptrToMap);
+	*left->ptrToMap = NULL;
+	free(*right->ptrToMap);
+	*right->ptrToMap = NULL;
+
+	for(unsigned i=0;i<HASH_RANGE_1;++i)
+	{
+		destroyVector(left->ptrToVec+i);
+		destroyVector(right->ptrToVec+i);
+	}
+
+	// Attach the new ones to first available position
+	unsigned pos                = getFirstAvailablePos(inter);
+	inter->mapRels[pos]         = newMap;
+	for(unsigned i=0;i<HASH_RANGE_1;++i)
+		inter->interResults[pos][i] = results[i];
+
+	free(results);
+	destroyRadixHashJoinInfo(left);
+	destroyRadixHashJoinInfo(right);
+}
+
+void joinNonInterInter(struct InterMetaData *inter,RadixHashJoinInfo* left,RadixHashJoinInfo* right)
+{
+	// Partition the two columns
+	partition(left);
+	partition(right);
+
+	// Build index (for the smallest one)
+	build(left,right);
+	left->isLeft  = 1;
+	right->isLeft = 0;
+
+	// Probe
+	jobsFinished=0;
+	struct Vector **results;
+	results = malloc(HASH_RANGE_1*sizeof(struct Vector*));
+	MALLOC_CHECK(results);
+	for(unsigned i=0;i<HASH_RANGE_1;++i)
+		createVector(results+i,left->tupleSize+right->tupleSize);
+
+	for(unsigned i=0;i<HASH_RANGE_1;++i){
+		struct joinArg *arg = js->joinJobs[i].argument;
+		arg->bucket         = i;
+		arg->left           = left;
+		arg->right          = right;
+		arg->results        = results[i];
+		pthread_mutex_lock(&queueMtx);
+		enQueue(jobQueue,&js->joinJobs[i]);
+		pthread_cond_signal(&condNonEmpty);
+		pthread_mutex_unlock(&queueMtx);
+	}
+	pthread_mutex_lock(&jobsFinishedMtx);
+	while (jobsFinished!=HASH_RANGE_1) {
+		pthread_cond_wait(&condJobsFinished,&jobsFinishedMtx);
+	}
+	jobsFinished = 0;
+	pthread_cond_signal(&condJobsFinished);
+	pthread_mutex_unlock(&jobsFinishedMtx);
+
+	// Update mapRels and interResults //
+	// Construct new mapping
+	unsigned *newMap = malloc(inter->queryRelations*sizeof(unsigned));
+	MALLOC_CHECK(newMap);
+
+	newMap[left->relId] = 0;
+	for(unsigned i=0;i<inter->queryRelations;++i)
+		if(i!=left->relId)
+			newMap[i] = (right->map[i]!=-1) ? 1+right->map[i] : -1;
+
+	// Free the old map arrays | Destroy the old vectors
+	free(*left->ptrToMap);
+	*left->ptrToMap = NULL;
+	free(*right->ptrToMap);
+	*right->ptrToMap = NULL;
+	for(unsigned i=0;i<HASH_RANGE_1;++i)
+	{
+		destroyVector(left->ptrToVec+i);
+		destroyVector(right->ptrToVec+i);
+	}
+
+	// Attach the new ones to first available position
+	unsigned pos                = getFirstAvailablePos(inter);
+	inter->mapRels[pos]         = newMap;
+	for(unsigned i=0;i<HASH_RANGE_1;++i)
+		inter->interResults[pos][i] = results[i];
+
+	free(results);
+	destroyRadixHashJoinInfo(left);
+	destroyRadixHashJoinInfo(right);
+}
+
+void joinInterNonInter(struct InterMetaData *inter,RadixHashJoinInfo* left,RadixHashJoinInfo* right)
+{
+
+	// Partition the two columns
+	partition(left);
+	partition(right);
+
+	// Build index (for the smallest one)
+	build(left,right);
+	left->isLeft  = 1;
+	right->isLeft = 0;
+
+	// Probe
+	struct Vector **results;
+	jobsFinished = 0;
+	results = malloc(HASH_RANGE_1*sizeof(struct Vector*));
+	MALLOC_CHECK(results);
+	for(unsigned i=0;i<HASH_RANGE_1;++i)
+		createVector(results+i,left->tupleSize+right->tupleSize);
+
+	for(unsigned i=0;i<HASH_RANGE_1;++i){
+		struct joinArg *arg = js->joinJobs[i].argument;
+		arg->bucket         = i;
+		arg->left           = left;
+		arg->right          = right;
+		arg->results        = results[i];
+		pthread_mutex_lock(&queueMtx);
+		enQueue(jobQueue,&js->joinJobs[i]);
+		pthread_cond_signal(&condNonEmpty);
+		pthread_mutex_unlock(&queueMtx);
+	}
+	pthread_mutex_lock(&jobsFinishedMtx);
+	while (jobsFinished!=HASH_RANGE_1) {
+		pthread_cond_wait(&condJobsFinished,&jobsFinishedMtx);
+	}
+	jobsFinished = 0;
+	pthread_cond_signal(&condJobsFinished);
+	pthread_mutex_unlock(&jobsFinishedMtx);
+
+	// Update mapRels and interResults //
+	// Construct new mapping
+	unsigned *newMap = malloc(inter->queryRelations*sizeof(unsigned));
+	MALLOC_CHECK(newMap);
+
+	for(unsigned i=0;i<inter->queryRelations;++i)
+		newMap[i] = left->map[i];
+	newMap[right->relId] = left->tupleSize;
+
+	// Free the old map arrays | Destroy the old vectors
+	free(*left->ptrToMap);
+	*left->ptrToMap = NULL;
+	free(*right->ptrToMap);
+	*right->ptrToMap = NULL;
+	for(unsigned i=0;i<HASH_RANGE_1;++i)
+	{
+		destroyVector(left->ptrToVec+i);
+		destroyVector(right->ptrToVec+i);
+	}
+
+	// Attach the new ones to first available position
+	unsigned pos                = getFirstAvailablePos(inter);
+	inter->mapRels[pos]         = newMap;
+	for(unsigned i=0;i<HASH_RANGE_1;++i)
+		inter->interResults[pos][i] = results[i];
+
+	free(results);
+	destroyRadixHashJoinInfo(left);
+	destroyRadixHashJoinInfo(right);
+}
+
+void joinInterInter(struct InterMetaData *inter,RadixHashJoinInfo* left,RadixHashJoinInfo* right)
+{
+	if(left->vector == right->vector)
+	{
+		unsigned posLeft  = left->map[left->relId];
+		unsigned posRight = right->map[right->relId];
+		colEqualityInter(left->col,right->col,posLeft,posRight,left->ptrToVec);
+		return;
+	}
+	// Partition the two columns
+	partition(left);
+	partition(right);
+
+	// Build index (for the smallest one)
+	build(left,right);
+	left->isLeft  = 1;
+	right->isLeft = 0;
+
+	// Probe
+	struct Vector **results;
+	jobsFinished=0;
+	results = malloc(HASH_RANGE_1*sizeof(struct Vector*));
+	MALLOC_CHECK(results);
+	for(unsigned i=0;i<HASH_RANGE_1;++i)
+		createVector(results+i,left->tupleSize+right->tupleSize);
+
+	for(unsigned i=0;i<HASH_RANGE_1;++i){
+		struct joinArg *arg = js->joinJobs[i].argument;
+		arg->bucket         = i;
+		arg->left           = left;
+		arg->right          = right;
+		arg->results        = results[i];
+		pthread_mutex_lock(&queueMtx);
+		enQueue(jobQueue,&js->joinJobs[i]);
+		pthread_cond_signal(&condNonEmpty);
+		pthread_mutex_unlock(&queueMtx);
+	}
+	pthread_mutex_lock(&jobsFinishedMtx);
+	while (jobsFinished!=HASH_RANGE_1) {
+		pthread_cond_wait(&condJobsFinished,&jobsFinishedMtx);
+	}
+	jobsFinished = 0;
+	pthread_cond_signal(&condJobsFinished);
+	pthread_mutex_unlock(&jobsFinishedMtx);
+
+	// Update mapRels and interResults //
+	// Construct new mapping
+	unsigned *newMap = malloc(inter->queryRelations*sizeof(unsigned));
+	MALLOC_CHECK(newMap);
+	for(unsigned i=0;i<inter->queryRelations;++i)
+		newMap[i] = left->map[i];
+
+	for(unsigned i=0;i<inter->queryRelations;++i)
+		if(newMap[i]==-1)
+			newMap[i] = (right->map[i]!=-1) ? right->map[i]+left->tupleSize : -1;
+
+	// Free the old map arrays | Destroy the old vectors
+	free(*left->ptrToMap);
+	*left->ptrToMap = NULL;
+	free(*right->ptrToMap);
+	*right->ptrToMap = NULL;
+	for(unsigned i=0;i<HASH_RANGE_1;++i)
+	{
+		destroyVector(left->ptrToVec+i);
+		destroyVector(right->ptrToVec+i);
+	}
+
+	// Attach the new ones to first available position
+	unsigned pos                = getFirstAvailablePos(inter);
+	inter->mapRels[pos]         = newMap;
+	for(unsigned i=0;i<HASH_RANGE_1;++i)
+		inter->interResults[pos][i] = results[i];
+
+	free(results);
+	destroyRadixHashJoinInfo(left);
+	destroyRadixHashJoinInfo(right);
+}  #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+
+#include "Joiner.h"
+#include "Relation.h"
+#include "Intermediate.h"
+#include "Vector.h"
+#include "Utils.h"
+
+unsigned RADIX_BITS;
+unsigned HASH_RANGE_1;
+
+void createJoiner(struct Joiner **joiner)
+{
+	*joiner = malloc(sizeof(struct Joiner));
+	MALLOC_CHECK(*joiner);
+	(*joiner)->numOfRelations = 0;
+	(*joiner)->relations      = NULL;
+}
+
+void setup(struct Joiner *joiner)
+{
+	/* Contains all file names : "r0\nr1\nr2\n....r20\n" */
+	char *buffer   = malloc(BUFFERSIZE*sizeof(char));
+	MALLOC_CHECK(buffer);
+	char *allNames = buffer;
+
+	/* We assume that file name will be at most 18[do not forget '\n' and '\0'] characters long */
+	char fileName[20];
+
+	/* Get number of relations and store file names to allNames */
+	allNames[0] = '\0';
+	while (fgets(fileName, sizeof(fileName), stdin) != NULL)
+	{
+		if(!strcmp(fileName,"Done\n"))
+			break;
+		++joiner->numOfRelations;
+		strcat(allNames,fileName);
+	}
+
+	/* Allocate space to store relations */
+	joiner->relations = malloc(joiner->numOfRelations*sizeof(struct Relation*));
+	MALLOC_CHECK(joiner->relations);
+
+	/* Add realation corresponding to the fileName scanned from allNames */
+	int offset;
+	while(sscanf(allNames,"%s%n",fileName,&offset)>0)
+	{
+		addRelation(joiner,fileName);
+		allNames+=offset;
+	}
+	setRadixBits(joiner);
+ 	setVectorInitSize(joiner);
+	free(buffer);
+}
+
+void addRelation(struct Joiner *joiner,char *fileName)
+{
+
+	/* Indicates the number of relations added so far */
+	static unsigned i=0;
+
+	/* Create a new relation */
+	struct Relation *rel;
+	createRelation(&rel,fileName);
+
+	/* Add it to joiner's "relations" array */
+	joiner->relations[i++] = rel;
+	// dumpRelation(rel,fileName);
+}
+
+void join(struct Joiner *joiner,struct QueryInfo *q)
+{
+	struct InterMetaData *inter;
+	createInterMetaData(&inter,q);
+
+	// fprintf(stderr,"=========================================================\n");
+	// fprintf(stderr,"Column Equalities\n");
+	// fprintf(stderr,"=========================================================\n");
+	applyColumnEqualities(inter,joiner,q);
+
+	// fprintf(stderr,"=========================================================\n");
+	// fprintf(stderr,"Filters\n");
+	// fprintf(stderr,"=========================================================\n");
+	applyFilters(inter,joiner,q);
+
+	// fprintf(stderr,"=========================================================\n");
+	// fprintf(stderr,"Joins\n");
+	// fprintf(stderr,"=========================================================\n");
+	applyJoins(inter,joiner,q);
+
+
+	// fprintf(stderr,"=========================================================\n");
+	// fprintf(stderr,"CheckSums\n");
+	// fprintf(stderr,"=========================================================\n");
+	applyCheckSums(inter,joiner,q);
+
+
+	// fprintf(stderr,"=========================================================\n");
+	// fprintf(stderr,"Destruction\n");
+	// fprintf(stderr,"=========================================================\n");
+	destroyInterMetaData(inter);
+}
+
+uint64_t *getColumn(struct Joiner *joiner,unsigned relId,unsigned colId)
+{
+	return joiner->relations[relId]->columns[colId];
+}
+
+unsigned getRelationTuples(struct Joiner *joiner,unsigned relId)
+{
+	return joiner->relations[relId]->numOfTuples;
+}
+
+void setVectorInitSize(struct Joiner *joiner)
+{
+	/**
+	 * small	: 1000
+	 * medium	: 1000
+	 * large	: 5000
+	 * public	: 500000
+	 */
+
+	unsigned sum            = 0;
+	unsigned avgNumOfTuples = 0;
+	for(unsigned i=0;i<joiner->numOfRelations;++i)
+		sum+=joiner->relations[i]->numOfTuples;
+	avgNumOfTuples = sum/joiner->numOfRelations;
+
+	if(avgNumOfTuples<500000)
+		initSize = 1000;
+	else if(avgNumOfTuples<1200000)
+		initSize = 1000;
+	else if(avgNumOfTuples<2000000)
+		initSize = 5000;
+	else
+		initSize = 500000;
+}
+
+void setRadixBits(struct Joiner *joiner)
+{
+	unsigned sum            = 0;
+	unsigned avgNumOfTuples = 0;
+	for(unsigned i=0;i<joiner->numOfRelations;++i)
+		sum+=joiner->relations[i]->numOfTuples;
+	avgNumOfTuples = sum/joiner->numOfRelations;
+
+	/**
+	 * small	: 4,16
+	 * medium	: 5,32
+	 * large	: 5,32
+	 * public	: 8,256
+	 */
+
+	 if (avgNumOfTuples<500000) {
+		 	RADIX_BITS   = 4;
+			HASH_RANGE_1 = 16;
+	} else if (avgNumOfTuples<2000000) {
+			RADIX_BITS   = 5;
+			HASH_RANGE_1 = 32;
+	 } else {
+			RADIX_BITS   = 8;
+			HASH_RANGE_1 = 256;
+	 }
+}
+
+void destroyJoiner(struct Joiner *joiner)
+{
+	for (unsigned i=0;i<joiner->numOfRelations;++i)
+		destroyRelation(joiner->relations[i]);
+	free(joiner->relations);
+	free(joiner);
+}  #include <stdio.h>
+#include <stdlib.h> /*malloc(),free()*/
+#include <string.h>/* strerror() */
+#include <unistd.h> /*sleep()--debugging*/
+#include <time.h> /*time()--debugging*/
+#include <pthread.h>
+
+#include "Utils.h"
+#include "JobScheduler.h"
+#include "Joiner.h"
+#include "Partition.h"
+#include "Build.h"
+#include "Probe.h"
+#include "Operations.h"
+#include "Queue.h"
+
+#define THREAD_NUM 4
+
+pthread_mutex_t queueMtx           = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t jobsFinishedMtx    = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t condNonEmpty        = PTHREAD_COND_INITIALIZER;
+pthread_cond_t condJobsFinished    = PTHREAD_COND_INITIALIZER;
+struct Queue* jobQueue             = NULL;
+struct JobScheduler* js            = NULL;
+pthread_mutex_t* partitionMtxArray = NULL;
+unsigned jobsFinished              = 0;
+pthread_barrier_t barrier;
+
+void createJobScheduler(struct JobScheduler** js){
+
+  *js              = malloc(sizeof(struct JobScheduler));
+  MALLOC_CHECK(*js);
+  (*js)->threadNum = THREAD_NUM;
+  (*js)->tids      = malloc((*js)->threadNum*sizeof(pthread_t));
+  MALLOC_CHECK((*js)->tids);
+
+  // Create Queue with 1000 jobs max size
+  createQueue(&jobQueue,1000);
+
+  // Create worker threads
+  int err;
+  for(unsigned i=0;i<(*js)->threadNum;++i){
+    if(err = pthread_create((*js)->tids+i,NULL,threadFunc,(void*)0)){
+      exit(EXIT_FAILURE);
+    }
+  }
+
+  /* Initialize partition mutex array */
+  partitionMtxArray = malloc(HASH_RANGE_1*sizeof(pthread_mutex_t));
+  MALLOC_CHECK(partitionMtxArray);
+  for(unsigned i=0;i<HASH_RANGE_1;++i)
+    pthread_mutex_init(partitionMtxArray+i,NULL);
+
+  /* Initialize the barrier */
+  pthread_barrier_init(&barrier, NULL, (*js)->threadNum+1);
+  /* Create job arrays */
+  createJobArrays(*js);
+}
+
+void createJobArrays(struct JobScheduler* js){
+
+  /* Create array with checkSums */
+  js->checkSumArray = malloc(HASH_RANGE_1*sizeof(uint64_t));
+  MALLOC_CHECK(js->checkSumArray);
+
+  /* Create array with  histograms */
+  js->histArray = malloc(js->threadNum*sizeof(unsigned*));
+  MALLOC_CHECK(js->histArray);
+  for(unsigned i=0;i<js->threadNum;++i)
+  {
+    js->histArray[i] = malloc(HASH_RANGE_1*sizeof(unsigned));
+    MALLOC_CHECK(js->histArray[i]);
+  }
+
+  /* Create array with histogram jobs */
+  js->histJobs = malloc(js->threadNum*sizeof(struct Job));
+  MALLOC_CHECK(js->histJobs);
+  for(unsigned i=0;i<js->threadNum;++i){
+    js->histJobs[i].argument                                = malloc(sizeof(struct histArg));
+    MALLOC_CHECK(js->histJobs[i].argument);
+    ((struct histArg *)js->histJobs[i].argument)->histogram = js->histArray[i];
+    js->histJobs[i].function 	                              = histFunc;
+  }
+
+  /* Create array with partition jobs */
+  js->partitionJobs = malloc(js->threadNum*sizeof(struct Job));
+  MALLOC_CHECK(js->partitionJobs);
+  for(unsigned i=0;i<js->threadNum;++i){
+    js->partitionJobs[i].argument  = malloc(sizeof(struct partitionArg));
+    MALLOC_CHECK(js->partitionJobs[i].argument);
+    js->partitionJobs[i].function = partitionFunc;
+  }
+
+  /* Create array with build jobs */
+  js->buildJobs = malloc(HASH_RANGE_1*sizeof(struct Job));
+  MALLOC_CHECK(js->buildJobs);
+  for(unsigned i=0;i<HASH_RANGE_1;++i){
+    js->buildJobs[i].argument = malloc(sizeof(struct buildArg));
+    MALLOC_CHECK(js->buildJobs[i].argument);
+    js->buildJobs[i].function = buildFunc;
+  }
+
+  /* Create array with join jobs */
+  js->joinJobs = malloc(HASH_RANGE_1*sizeof(struct Job));
+  MALLOC_CHECK(js->joinJobs);
+  for(unsigned i=0;i<HASH_RANGE_1;++i){
+    js->joinJobs[i].argument = malloc(sizeof(struct joinArg));
+    MALLOC_CHECK(js->joinJobs[i].argument);
+    js->joinJobs[i].function = joinFunc;
+  }
+
+  /* Create array with columnEquality jobs */
+  js->colEqualityJobs = malloc(HASH_RANGE_1*sizeof(struct Job));
+  MALLOC_CHECK(js->colEqualityJobs);
+  for(unsigned i=0;i<HASH_RANGE_1;++i){
+    js->colEqualityJobs[i].argument = malloc(sizeof(struct colEqualityArg));
+    MALLOC_CHECK(js->colEqualityJobs[i].argument);
+    js->colEqualityJobs[i].function = colEqualityFunc;
+  }
+
+  /* Create array with filter jobs */
+  js->filterJobs = malloc(HASH_RANGE_1*sizeof(struct Job));
+  MALLOC_CHECK(js->filterJobs);
+  for(unsigned i=0;i<HASH_RANGE_1;++i){
+    js->filterJobs[i].argument = malloc(sizeof(struct filterArg));
+    MALLOC_CHECK(js->filterJobs[i].argument);
+    js->filterJobs[i].function = filterFunc;
+  }
+
+  /* Create array with checksum jobs */
+  js->checkSumJobs = malloc(HASH_RANGE_1*sizeof(struct Job));
+  MALLOC_CHECK(js->checkSumJobs);
+  for(unsigned i=0;i<HASH_RANGE_1;++i){
+    js->checkSumJobs[i].argument = malloc(sizeof(struct checkSumArg));
+    MALLOC_CHECK(js->checkSumJobs[i].argument);
+    js->checkSumJobs[i].function = checkSumFunc;
+  }
+}
+
+void *threadFunc(void * arg){
+
+  // fprintf(stderr, "thread[%u] entering the threadFunc\n",(unsigned)pthread_self());
+  int err;
+  while(1){
+    // Acquire mutex and check if there is a job in the queue
+    pthread_mutex_lock(&queueMtx);
+    while (isEmpty(jobQueue)) {
+      // fprintf(stderr, "Going to sleep\n");
+      pthread_cond_wait(&condNonEmpty,&queueMtx);
+      // fprintf(stderr, "thread[%u] woke up\n",(unsigned)pthread_self());
+    }
+
+    // Finally found a job to work on
+    // deQueue the job and release the mutex [also signal the cond var]
+    struct Job* job = deQueue(jobQueue);
+    pthread_cond_signal(&condNonEmpty);
+    pthread_mutex_unlock(&queueMtx);
+
+    // Special kind of job indicating the end of our program
+    if(job==NULL)
+    {
+      // fprintf(stderr, "thread[%u] exiting...\n",(unsigned)pthread_self());
+      pthread_exit((void*)0);
+    }
+
+    // Execute the function of your job & destroy the argument afterwards[if it has been malloc'd]
+    (*(job->function))(job->argument);
+  }
+}
+
+void destroyJobScheduler(struct JobScheduler* js){
+
+  // Send "termination" jobs
+  for(unsigned i=0;i<js->threadNum;++i){
+    pthread_mutex_lock(&queueMtx);
+    enQueue(jobQueue,NULL);
+    pthread_cond_signal(&condNonEmpty);
+    pthread_mutex_unlock(&queueMtx);
+  }
+  // Broadcast to make sure every worker gets its "termination" job
+  pthread_mutex_lock(&queueMtx);
+  pthread_cond_broadcast(&condNonEmpty);
+  pthread_mutex_unlock(&queueMtx);
+
+  // Join worker threads
+  int err;
+  for(unsigned i=0;i<js->threadNum;++i){
+    if(err = pthread_join(js->tids[i],NULL)){
+      fprintf(stderr, "pthread_join: %s\n",strerror(err));
+      exit(EXIT_FAILURE);
+    }
+  }
+
+  // Destroy thread id table
+  free(js->tids);
+
+  // Destroy Queue
+  destroyQueue(jobQueue);
+
+  // Destroy mutexes and cond vars
+  if (err = pthread_mutex_destroy(&queueMtx)) {
+    fprintf(stderr, "pthread_mutex_destroy[queueMtx]: %s\n",strerror(err));
+    exit(EXIT_FAILURE);
+  }
+
+  if (err = pthread_mutex_destroy(&jobsFinishedMtx)) {
+    fprintf(stderr, "pthread_mutex_destroy[jobsFinishedMtx]: %s\n",strerror(err));
+    exit(EXIT_FAILURE);
+  }
+
+  if(err = pthread_cond_destroy(&condNonEmpty)){
+    fprintf(stderr, "pthread_cond_destroy: %s\n",strerror(err));
+    exit(EXIT_FAILURE);
+  }
+
+  if(err = pthread_cond_destroy(&condJobsFinished)){
+    fprintf(stderr, "pthread_cond_destroy: %s\n",strerror(err));
+    exit(EXIT_FAILURE);
+  }
+
+  // Destroy partition mutex array
+  for(unsigned i=0;i<HASH_RANGE_1;++i)
+  if (err = pthread_mutex_destroy(partitionMtxArray+i)) {
+    fprintf(stderr, "pthread_mutex_destroy[partitionMtxArray]: %s\n",strerror(err));
+    exit(EXIT_FAILURE);
+  }
+  free(partitionMtxArray);
+
+  // Destroy barrier
+  pthread_barrier_destroy(&barrier);
+
+  // Destroy arrays with jobs , checkSums and histograms
+  free(js->checkSumArray);
+
+  for(unsigned i=0;i<js->threadNum;++i)
+    free(js->histArray[i]);
+  free(js->histArray);
+
+  for(unsigned i=0;i<js->threadNum;++i)
+    free(js->histJobs[i].argument);
+  free(js->histJobs);
+
+  for(unsigned i=0;i<js->threadNum;++i)
+    free(js->partitionJobs[i].argument);
+  free(js->partitionJobs);
+
+  for(unsigned i=0;i<HASH_RANGE_1;++i)
+    free(js->buildJobs[i].argument);
+  free(js->buildJobs);
+
+  for(unsigned i=0;i<HASH_RANGE_1;++i)
+    free(js->joinJobs[i].argument);
+  free(js->joinJobs);
+
+  for(unsigned i=0;i<HASH_RANGE_1;++i)
+    free(js->colEqualityJobs[i].argument);
+  free(js->colEqualityJobs);
+
+  for(unsigned i=0;i<HASH_RANGE_1;++i)
+    free(js->filterJobs[i].argument);
+  free(js->filterJobs);
+
+
+  for(unsigned i=0;i<HASH_RANGE_1;++i)
+    free(js->checkSumJobs[i].argument);
+  free(js->checkSumJobs);
+
+  // Destroy JobScheduler
+  free(js);
+}  #include <stdio.h>
+#include <string.h>/*strlen()*/
+#include <unistd.h>/*write()*/
+#include <stdlib.h>/*free()*/
+#include <pthread.h>
+
+#include "Intermediate.h"
+#include "Parser.h"
+#include "Partition.h"
+#include "Operations.h"
+#include "Utils.h"
+#include "Vector.h"/* destroyVector(..)*/
+#include "Queue.h"
+#include "JobScheduler.h"
+
+void createInterMetaData(struct InterMetaData **inter,struct QueryInfo *q)
+{
+	*inter                    = malloc(sizeof(struct InterMetaData));
+	MALLOC_CHECK(*inter);
+	(*inter)->maxNumOfVectors = getNumOfFilters(q) + getNumOfColEqualities(q) + getNumOfJoins(q);
+	(*inter)->interResults    = malloc((*inter)->maxNumOfVectors*sizeof(struct Vector**));
+	MALLOC_CHECK((*inter)->interResults);
+
+	(*inter)->mapRels         = malloc((*inter)->maxNumOfVectors*sizeof(unsigned*));
+	MALLOC_CHECK((*inter)->mapRels );
+	(*inter)->queryRelations  = getNumOfRelations(q);
+
+	for(unsigned i=0;i<(*inter)->maxNumOfVectors;++i){
+		(*inter)->interResults[i] = malloc(HASH_RANGE_1*sizeof(struct Vector*));
+		MALLOC_CHECK((*inter)->interResults[i]);
+		for(unsigned v=0;v<HASH_RANGE_1;++v)
+			(*inter)->interResults[i][v] = NULL;
+		(*inter)->mapRels[i] = NULL;
+	}
+}
+
+void applyColumnEqualities(struct InterMetaData *inter,struct Joiner* joiner,struct QueryInfo *q)
+{
+	for(unsigned i=0;i<q->numOfPredicates;++i)
+		if(isColEquality(&q->predicates[i]))
+		{
+
+			unsigned original      = getOriginalRelId(q,&q->predicates[i].left);
+			unsigned relId         = getRelId(&q->predicates[i].left);
+			unsigned leftColId     = getColId(&q->predicates[i].left);
+			unsigned rightColId    = getColId(&q->predicates[i].right);
+			unsigned pos           = getVectorPos(inter,relId);
+			struct Vector **vector = inter->interResults[pos]+0;
+			unsigned numOfTuples   = getRelationTuples(joiner,original);
+			uint64_t *leftCol      = getColumn(joiner,original,leftColId);
+			uint64_t *rightCol     = getColumn(joiner,original,rightColId);
+			if(isInInter(vector[0]))
+			{
+				// fprintf(stderr, "Column Equality Inter\n");
+				// printf("~~~Again~~~\n");
+				// printf("Pos:%u\n",pos);
+				// printf("%u.%u=%u.%u [r%u.tbl]\n",relId,leftColId,relId,rightColId,original);
+				colEqualityInter(leftCol,rightCol,0,0,vector);
+			}
+			else
+			{
+				// fprintf(stderr, "Column Equality\n");
+				// printf("%u.%u=%u.%u [r%u.tbl]\n",relId,leftColId,relId,rightColId,original);
+				unsigned *values = malloc(inter->queryRelations*sizeof(unsigned));
+				MALLOC_CHECK(values);
+				for(unsigned i=0;i<inter->queryRelations;++i)
+					values[i] = (i==relId) ? 0 : -1;
+				createMap(&inter->mapRels[pos],inter->queryRelations,values);
+				free(values);
+				colEquality(leftCol,rightCol,numOfTuples,vector);
+			}
+			// printf("\n\n");
+		}
+}
+
+void applyFilters(struct InterMetaData *inter,struct Joiner* joiner,struct QueryInfo *q)
+{
+	for(unsigned i=0;i<q->numOfFilters;++i)
+	{
+		unsigned original      = getOriginalRelId(q,&q->filters[i].filterLhs);
+		unsigned relId         = getRelId(&q->filters[i].filterLhs);
+		unsigned colId         = getColId(&q->filters[i].filterLhs);
+		uint64_t constant      = getConstant(&q->filters[i]);
+		Comparison cmp         = getComparison(&q->filters[i]);
+		unsigned pos           = getVectorPos(inter,relId);
+		struct Vector **vector = inter->interResults[pos];
+		unsigned numOfTuples   = getRelationTuples(joiner,original);
+		uint64_t *col          = getColumn(joiner,original,colId);
+		if(isInInter(vector[0]))
+		{
+			// fprintf(stderr,"%u.%u%c%lu [r%u.tbl]\n\n",relId,colId,cmp,constant,original);
+			filterInter(col,cmp,constant,vector);
+		}
+		else
+		{
+			// Create map array [0 in every place except for the relId-th place]
+			unsigned *values = malloc(inter->queryRelations*sizeof(unsigned));
+			MALLOC_CHECK(values);
+			for(unsigned i=0;i<inter->queryRelations;++i)
+				values[i] = (i==relId) ? 0 : -1;
+			createMap(&inter->mapRels[pos],inter->queryRelations,values);
+			free(values);
+
+			// Add filter jobs to the queue
+			jobsFinished = 0;
+			unsigned chunkSize = numOfTuples / HASH_RANGE_1;
+			unsigned lastEnd = 0;
+			unsigned i;
+			for(i=0;i<HASH_RANGE_1-1;++i){
+				struct filterArg *arg = js->filterJobs[i].argument;
+				arg->col              = col;
+				arg->constant         = constant;
+				arg->cmp							= cmp;
+				arg->start        		= i*chunkSize;
+				arg->end              = arg->start + chunkSize;
+				arg->vector           = vector+i;
+				lastEnd = arg->end;
+				pthread_mutex_lock(&queueMtx);
+				enQueue(jobQueue,&js->filterJobs[i]);
+				pthread_cond_signal(&condNonEmpty);
+				pthread_mutex_unlock(&queueMtx);
+			}
+			struct filterArg *arg = js->filterJobs[i].argument;
+			arg->col              = col;
+			arg->constant         = constant;
+			arg->cmp							= cmp;
+			arg->start        		= lastEnd;
+			arg->end              = numOfTuples;
+			arg->vector           = vector+i;
+			pthread_mutex_lock(&queueMtx);
+			enQueue(jobQueue,&js->filterJobs[i]);
+			pthread_cond_signal(&condNonEmpty);
+			pthread_mutex_unlock(&queueMtx);
+
+			// Wait for all filter jobs to finish
+			pthread_mutex_lock(&jobsFinishedMtx);
+			while (jobsFinished!=HASH_RANGE_1) {
+				pthread_cond_wait(&condJobsFinished,&jobsFinishedMtx);
+			}
+			jobsFinished = 0;
+			pthread_cond_signal(&condJobsFinished);
+			pthread_mutex_unlock(&jobsFinishedMtx);
+		}
+	}
+}
+
+void applyJoins(struct InterMetaData *inter,struct Joiner* joiner,struct QueryInfo *q)
+{
+	for(unsigned i=0;i<q->numOfPredicates;++i)
+		if(!isColEquality(&q->predicates[i]))
+		{
+			RadixHashJoinInfo argLeft,argRight;
+			initializeInfo(inter,q,&q->predicates[i].left,joiner,&argLeft);
+			// printf(" = ");
+			initializeInfo(inter,q,&q->predicates[i].right,joiner,&argRight);
+			// printf("\n");
+			applyProperJoin(inter,&argLeft,&argRight);
+			// printf("\n");
+		}
+}
+
+void applyProperJoin(struct InterMetaData *inter,RadixHashJoinInfo* argLeft,RadixHashJoinInfo* argRight)
+{
+	switch(argLeft->isInInter){
+	case 0:
+		switch(argRight->isInInter){
+			case 0:
+				// fprintf(stderr, "joinNonInterNonInter()\n");
+				joinNonInterNonInter(inter,argLeft,argRight);
+				break;
+			case 1:
+				// fprintf(stderr, "joinNonInterInter()\n");
+				joinNonInterInter(inter,argLeft,argRight);
+				break;
+		}
+		break;
+	case 1:
+		switch(argRight->isInInter){
+			case 0:
+				// fprintf(stderr, "joinInterNonInter()\n");
+				joinInterNonInter(inter,argLeft,argRight);
+				break;
+			case 1:
+				// fprintf(stderr, "joinInterInter()\n");
+				joinInterInter(inter,argLeft,argRight);
+				break;
+		}
+	}
+}
+
+unsigned getVectorPos(struct InterMetaData *inter,unsigned relId)
+{
+	for(unsigned i=0;i<inter->maxNumOfVectors;++i)
+		if(inter->mapRels[i])
+			if(inter->mapRels[i][relId]!=-1)
+				return i;
+	return getFirstAvailablePos(inter);
+}
+
+unsigned getFirstAvailablePos(struct InterMetaData* inter)
+{
+	for(unsigned i=0;i<inter->maxNumOfVectors;++i)
+		if(!inter->mapRels[i])
+			return i;
+}
+
+void createMap(unsigned **mapRels,unsigned size,unsigned *values)
+{
+	// -1 unsigned = 4294967295 [Hopefully we won't have to deal with so many relations]
+	*mapRels = malloc(size*sizeof(unsigned));
+	MALLOC_CHECK(*mapRels);
+	for(unsigned j=0;j<size;++j)
+		(*mapRels)[j] = values[j];
+}
+
+unsigned isInInter(struct Vector *vector)
+{return vector!=NULL;}
+
+void applyCheckSums(struct InterMetaData *inter,struct Joiner* joiner,struct QueryInfo *q)
+{
+	for(unsigned i=0;i<q->numOfSelections;++i)
+	{
+		unsigned original      = getOriginalRelId(q,&q->selections[i]);
+		unsigned relId         = getRelId(&q->selections[i]);
+		unsigned colId         = getColId(&q->selections[i]);
+		struct Vector **vector = inter->interResults[getVectorPos(inter,relId)];
+		unsigned *rowIdMap     = inter->mapRels[getVectorPos(inter,relId)];
+		uint64_t *col          = getColumn(joiner,original,colId);
+		unsigned isLast        = i == q->numOfSelections-1;
+
+		// In case the given relation did not take participate in any of the predicates/filters
+		if(!isInInter(vector[0]))
+			printCheckSum(0,isLast);
+		else
+		{
+			// Add checkSum jobs to the queue
+			for(unsigned i=0;i<HASH_RANGE_1;++i){
+				struct checkSumArg *arg = js->checkSumJobs[i].argument;
+				arg->vector             = vector[i];
+				arg->col                = col;
+				arg->rowIdPos           = rowIdMap[relId];
+				arg->sum                = js->checkSumArray+i;
+				pthread_mutex_lock(&queueMtx);
+				enQueue(jobQueue,&js->checkSumJobs[i]);
+				pthread_cond_signal(&condNonEmpty);
+				pthread_mutex_unlock(&queueMtx);
+			}
+			// Wait for all checkSum jobs to finish
+			pthread_mutex_lock(&jobsFinishedMtx);
+			while (jobsFinished!=HASH_RANGE_1) {
+				pthread_cond_wait(&condJobsFinished,&jobsFinishedMtx);
+			}
+			jobsFinished = 0;
+			pthread_cond_signal(&condJobsFinished);
+			pthread_mutex_unlock(&jobsFinishedMtx);
+
+			// Gather and sum the partial sums
+			uint64_t allCheckSums=0;
+			for(unsigned i=0;i<HASH_RANGE_1;++i)
+				allCheckSums+=js->checkSumArray[i];
+			printCheckSum(allCheckSums,isLast);
+		}
+	}
+}
+
+void printCheckSum(uint64_t checkSum,unsigned isLast)
+{
+	char string[100];
+	if(checkSum)
+		sprintf(string,"%lu",checkSum);
+	else
+		sprintf(string,"NULL");
+
+	if(isLast)
+	{
+		// fprintf(stderr,"%s\n",string);
+		printf("%s\n",string);
+		fflush(stdout);
+	}
+	else
+	{
+		// fprintf(stderr,"%s ",string);
+		printf("%s ",string);
+	}
+}
+
+
+void initializeInfo(struct InterMetaData *inter,struct QueryInfo *q,struct SelectInfo *s,struct Joiner *j,RadixHashJoinInfo *arg)
+{
+	arg->relId          = getRelId(s);
+	arg->colId          = getColId(s);
+	arg->col            = getColumn(j,getOriginalRelId(q,s),arg->colId);
+	arg->vector         = inter->interResults[getVectorPos(inter,arg->relId)];
+	arg->map            = inter->mapRels[getVectorPos(inter,arg->relId)];
+	arg->queryRelations = inter->queryRelations;
+	arg->ptrToVec       = inter->interResults[getVectorPos(inter,arg->relId)]+0;
+	arg->ptrToMap       = &inter->mapRels[getVectorPos(inter,arg->relId)];
+	arg->pos            = getVectorPos(inter,arg->relId);
+
+	if(isInInter(arg->vector[0]))
+	{
+		arg->isInInter   = 1;
+		arg->numOfTuples = 0;
+		for(unsigned i=0;i<HASH_RANGE_1;++i)
+			if(arg->vector[i])
+				arg->numOfTuples += getVectorTuples(arg->vector[i]);
+		arg->tupleSize   = getTupleSize(arg->vector[0]);
+	}
+	else
+	{
+		arg->isInInter   = 0;
+		arg->numOfTuples = getRelationTuples(j,getOriginalRelId(q,s));
+		arg->tupleSize   = 1;
+	}
+}
+
+
+void destroyInterMetaData(struct InterMetaData *inter)
+{
+	for(unsigned i=0;i<inter->maxNumOfVectors;++i)
+	{
+		for(unsigned v=0;v<HASH_RANGE_1;++v)
+			destroyVector(inter->interResults[i]+v);
+		free(inter->interResults[i]);
+		free(inter->mapRels[i]);
+	}
+	free(inter->interResults);
+	free(inter->mapRels);
+	free(inter);
+}
+
+
+void destroyRadixHashJoinInfo(RadixHashJoinInfo *info)
+{
+	destroyColumnInfo(&info->unsorted);
+	destroyColumnInfo(&info->sorted);
+	free(info->hist);
+	free(info->pSum);
+
+	/* For every bucket of the relation */
+	for(unsigned i=0;i<HASH_RANGE_1;++i)
+		/* If we've created an array of indexes for this relation */
+		if(info->indexArray)
+			/* If this bucket has an index */
+			if(info->indexArray[i] != NULL)
+			{
+				/* Free index fields */
+				free(info->indexArray[i]->chainArray);
+				free(info->indexArray[i]->bucketArray);
+
+				/* Free index struct itself */
+				free(info->indexArray[i]);
+			}
+	free(info->indexArray);
+}
+
+void destroyColumnInfo(ColumnInfo **c)
+{
+	if(*c)
+	{
+		free((*c)->values);
+		free((*c)->rowIds);
+		destroyVector(&(*c)->tuples);
+	}
+	free(*c);
+	*c = NULL;
+}  #include <stdio.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include <unistd.h> /*sleep()--debugging*/
+
+#include "Build.h"
+#include "Queue.h"
+#include "Partition.h"
+#include "JobScheduler.h"
+#include "Utils.h"
+
+void build(RadixHashJoinInfo *infoLeft,RadixHashJoinInfo *infoRight)
+{
+	RadixHashJoinInfo *big,*small;
+	big            = (infoLeft->numOfTuples >= infoRight->numOfTuples) ? infoLeft:infoRight;
+	small          = (infoLeft->numOfTuples < infoRight->numOfTuples) ? infoLeft:infoRight;
+	big->isSmall   = 0;
+	small->isSmall = 1;
+
+	initializeIndexArray(small);
+
+	jobsFinished = 0;
+	for(unsigned i=0;i<HASH_RANGE_1;++i){
+		struct buildArg *arg = js->buildJobs[i].argument;
+		arg->bucket = i;
+		arg->info = small;
+		pthread_mutex_lock(&queueMtx);
+		enQueue(jobQueue,&js->buildJobs[i]);
+		pthread_cond_signal(&condNonEmpty);
+		pthread_mutex_unlock(&queueMtx);
+	}
+
+	pthread_mutex_lock(&jobsFinishedMtx);
+	while (jobsFinished!=HASH_RANGE_1) {
+		pthread_cond_wait(&condJobsFinished,&jobsFinishedMtx);
+	}
+	jobsFinished = 0;
+	pthread_cond_signal(&condJobsFinished);
+	pthread_mutex_unlock(&jobsFinishedMtx);
+}
+
+void initializeIndexArray(RadixHashJoinInfo *info)
+{
+	unsigned i,j;
+	unsigned bucketSize;
+
+	/* Firstly, we need to malloc space for indexArray */
+	/* Remember: One struct Index per bucket */
+	info->indexArray = malloc(HASH_RANGE_1*sizeof(struct Index*));
+	MALLOC_CHECK(info->indexArray);
+
+
+	// For every bucket
+	for(i=0;i<HASH_RANGE_1;i++)
+	{
+		// If bucket is empty, its index will be NULL
+		if(info->hist[i] == 0)
+		info->indexArray[i] = NULL;
+
+		else
+		{
+			// Fetch bucket's size from hist array
+			// Remember: hist is array with ints
+			bucketSize = info->hist[i];
+
+			/* Allocate space for bucket's index */
+			info->indexArray[i] = malloc(sizeof(struct Index));
+			MALLOC_CHECK(info->indexArray[i]);
+
+
+			/* Allocate space for index's fields */
+			info->indexArray[i]->chainArray  = malloc(bucketSize*sizeof(unsigned));
+			MALLOC_CHECK(info->indexArray[i]->chainArray);
+			info->indexArray[i]->bucketArray = malloc(HASH_RANGE_2*sizeof(unsigned));
+			MALLOC_CHECK(info->indexArray[i]->bucketArray);
+
+			/* Initialize chainArray and bucketArray with 0's */
+			for(j=0;j<bucketSize;j++)
+			info->indexArray[i]->chainArray[j] = 0;
+
+			for(j=0;j<HASH_RANGE_2;j++)
+			info->indexArray[i]->bucketArray[j] = 0;
+		}
+	}
+}
+
+void buildFunc(void* arg)
+{
+	struct buildArg *myarg = arg;
+	unsigned bucketSize;
+	uint64_t hash;
+	unsigned chainPos;
+	int j;
+	int start;
+
+	if(myarg->info->indexArray[myarg->bucket] != NULL)
+	{
+
+		// Fetch bucket's starting point from pSum array
+		// Remember: pSum is array with pointers to int
+		start = myarg->info->pSum[myarg->bucket];
+
+		// Fetch bucket's size from hist array
+		// Remember: hist is array with ints
+		bucketSize = myarg->info->hist[myarg->bucket];
+
+		// fprintf(stderr,"[%u]bucketSize:%u\n",myarg->bucket,bucketSize);
+
+		/* Scan from the bottom of the bucket to the top */
+		for(j=start+bucketSize-1;j>=start;j--)
+		{
+			hash = HASH_FUN_2(myarg->info->sorted->values[j]);
+			// fprintf(stderr,"\nsecondHash(%lu): %lu\n",myarg->info->sorted->values[j],hash);
+
+			if(myarg->info->indexArray[myarg->bucket]->bucketArray[hash] == 0)
+			{
+				// fprintf(stderr,"Found empty spot in bucketArray\n");
+				myarg->info->indexArray[myarg->bucket]->bucketArray[hash] = (j-start)+1;
+				// fprintf(stderr,"bucketArray[%lu]: %u\n",hash,  myarg->info->indexArray[myarg->bucket]->bucketArray[hash] );
+			}
+			else
+			{
+				/* Find the first zero in chainArray
+					by following the chain and
+					store "(j-start) + 1" in that place */
+				chainPos = myarg->info->indexArray[myarg->bucket]->bucketArray[hash]-1;
+				traverseChain(chainPos, myarg->info->indexArray[myarg->bucket]->chainArray, j-start + 1);
+			}
+		}
+	}
+
+	pthread_mutex_lock(&jobsFinishedMtx);
+	// fprintf(stderr, "Thread[%u] working on bucket:%u | jobs already finished:%u\n",(unsigned)pthread_self(),myarg->bucket,jobsFinished);
+	++jobsFinished;
+	pthread_cond_signal(&condJobsFinished);
+	pthread_mutex_unlock(&jobsFinishedMtx);
+
+}
+
+void traverseChain(unsigned chainPos,unsigned* chainArray,unsigned posToBeStored)
+{
+	// fprintf(stderr,"Moving to chainArray[%u](now is equal to %u)\n",chainPos,chainArray[chainPos]);
+	while(1)
+	{
+		// We've found an empty spot in chainArray
+		if(chainArray[chainPos] == 0)
+		{
+			chainArray[chainPos] = posToBeStored;
+			// fprintf(stderr,"Found empty spot on chainArray[%u]\n",chainPos);
+			break;
+		}
+		/* Step further on the chain */
+		else
+		{
+			chainPos = chainArray[chainPos] - 1;
+			// fprintf(stderr,"Moving to chainArray[%u](now is equal to %u)\n",chainPos,chainArray[chainPos]);
+			// sleep(1);
+		}
+	}
+}  你能读懂这段程序么
+是的，我能读懂这段程序。这是一个实现数据库查询优化的程序，重点在于处理关系数据库中的连接（join）、过滤（filter）和列等值（column equality）操作，并使用多线程并行化来提高性能。以下是对代码的整体分析和核心功能的解释：
+
+---
+
+### **程序总体结构**
+1. **程序功能**：
+   - 程序的主要功能是实现一个关系数据库查询引擎，能够处理输入的查询，执行连接、过滤和列等值操作，并返回查询结果的校验和（checksum）。
+   - 它使用多线程（通过 `pthread` 实现）和任务调度（`JobScheduler`）来并行化操作，优化性能。
+   - 程序支持基于统计信息的查询优化（`Optimizer.h`），通过估计查询的中间结果大小来决定最优的连接顺序。
+   - 使用了 **Radix Hash Join** 算法来高效地执行连接操作。
+
+2. **核心文件和功能**：
+   - **Joiner.c/h**: 管理关系数据库的元数据，加载关系表，执行查询。
+   - **Parser.c/h**: 解析输入的查询字符串，分解为关系、谓词（连接条件）和选择（投影）。
+   - **Optimizer.c/h**: 基于统计信息优化查询执行，估算过滤和连接操作的结果大小。
+   - **Vector.c/h**: 实现动态向量（`Vector`）结构，用于存储中间结果。
+   - **Partition.c/h**: 实现 Radix Hash Join 的分区阶段，将数据按哈希值分配到桶中。
+   - **Build.c/h**: 构建哈希表索引，用于连接操作。
+   - **Probe.c/h**: 执行连接操作中的探查阶段，查找匹配的记录。
+   - **JobScheduler.c/h**: 实现任务调度器，使用线程池并行执行任务。
+   - **Intermediate.c/h**: 管理查询执行过程中的中间结果。
+   - **Queue.c/h**: 实现任务队列，用于线程池的任务调度。
+
+3. **运行流程**：
+   - **输入**：程序从标准输入读取关系表文件名和查询。
+   - **初始化**：加载关系表到内存，初始化任务调度器。
+   - **查询处理**：
+     - 解析查询，提取关系、谓词和选择。
+     - 使用统计信息估算过滤和连接的结果大小。
+     - 执行列等值、过滤和连接操作。
+     - 计算校验和并输出结果。
+   - **清理**：释放内存，销毁线程池和数据结构。
+
+4. **并行化**：
+   - 使用多线程（默认 4 个线程）并行执行分区、构建索引、探查和校验和计算。
+   - 通过任务队列（`Queue`）和条件变量（`pthread_cond`）实现线程同步。
+   - 使用屏障（`pthread_barrier`）确保某些阶段（如分区）所有线程完成后再继续。
+
+---
+
+### **主要数据结构**
+1. **Joiner**:
+   - 存储所有关系表（`Relation` 数组）。
+   - 提供方法加载关系、执行查询和销毁资源。
+
+2. **Relation**:
+   - 表示一个关系表，包含列数据（`columns`）、元数据（`numOfTuples`, `numOfCols`）和统计信息（`stats`）。
+   - 使用 `mmap` 将关系文件映射到内存以高效访问。
+
+3. **QueryInfo**:
+   - 存储查询的解析结果，包括：
+     - 参与的关系 ID（`relationIds`）。
+     - 谓词（`predicates`）：连接条件（如 `R.A = S.B`）或列等值条件（如 `R.A = R.B`）。
+     - 过滤条件（`filters`）：如 `R.A > 100`。
+     - 选择（`selections`）：需要输出的列。
+
+4. **Vector**:
+   - 动态数组结构，用于存储中间结果的元组（`table`）。
+   - 支持动态扩展（`realloc`）和固定大小初始化。
+
+5. **RadixHashJoinInfo**:
+   - 用于 Radix Hash Join 算法，存储列数据、分区信息（`hist`, `pSum`）、哈希表索引（`indexArray`）等。
+   - 支持中间结果和原始关系的处理。
+
+6. **InterMetaData**:
+   - 管理查询执行中的中间结果，存储多个 `Vector` 数组（`interResults`）和关系映射（`mapRels`）。
+
+7. **JobScheduler**:
+   - 实现线程池，管理任务队列（`jobQueue`）和线程（`tids`）。
+   - 支持多种任务类型（`histJobs`, `partitionJobs`, `buildJobs`, `joinJobs`, `colEqualityJobs`, `filterJobs`, `checkSumJobs`）。
+
+---
+
+### **核心算法**
+1. **Radix Hash Join**:
+   - **分区阶段**（`Partition.c`）：
+     - 使用哈希函数（`HASH_FUN_1`）将数据分配到多个桶（`HASH_RANGE_1`）。
+     - 每个桶存储值（`values`）、行 ID（`rowIds`）和元组（`tuples`）。
+     - 支持并行分区（可选，通过 `PARALLEL_PARTITION` 宏控制）。
+   - **构建阶段**（`Build.c`）：
+     - 为较小的关系构建哈希表（`indexArray`）。
+     - 使用第二级哈希函数（`HASH_FUN_2`）处理桶内冲突，构建链式索引（`chainArray`）。
+   - **探查阶段**（`Probe.c`）：
+     - 遍历较大关系的每个元组，在较小关系的哈希表中查找匹配。
+     - 构造新元组（合并左右关系的元组）并插入结果向量。
+
+2. **查询优化**（`Optimizer.c`）：
+   - **统计信息计算**：
+     - 为每个列计算最小值（`minValue`）、最大值（`maxValue`）、频率（`f`）和离散值数量（`discreteValues`）。
+     - 使用位向量（`bitVector`）记录值的存在。
+   - **估算中间结果**：
+     - 列等值（`applyColEqualityEstimations`）：更新列的统计信息，考虑值域交集。
+     - 过滤（`applyFilterEstimations`）：根据比较操作（`=`, `<`, `>`）调整统计信息。
+     - 连接（`applyJoinEstimations`）：估算连接结果的大小，更新统计信息。
+   - **连接顺序优化**（`findOptimalJoinOrder`）：目前代码中被注释，可能是未完全实现，计划根据估算成本排序连接谓词。
+
+3. **并行化**：
+   - 使用线程池并行执行分区、构建、探查和校验和计算。
+   - 任务通过队列分配，线程通过条件变量同步。
+   - 屏障确保所有线程在关键阶段（如分区完成）同步。
+
+---
+
+### **程序执行流程**
+1. **主程序（`main.c`）**：
+   - 初始化 `Joiner` 和 `JobScheduler`。
+   - 调用 `setup` 加载关系表。
+   - 循环读取查询，调用 `createQueryInfo` 解析查询。
+   - 执行优化（`createQueryEstimations`, `applyColEqualityEstimations`, `applyFilterEstimations`, `applyJoinEstimations`）。
+   - 执行查询（`join`）。
+   - 清理资源。
+
+2. **查询执行（`join` in `Joiner.c`）**：
+   - 创建中间结果元数据（`InterMetaData`）。
+   - 依次应用列等值（`applyColumnEqualities`）、过滤（`applyFilters`）和连接（`applyJoins`）。
+   - 计算校验和（`applyCheckSums`）并输出。
+
+3. **测试框架（第二个 `main` 函数）**：
+   - 读取初始化文件（`init-file`）、工作负载文件（`workload-file`）和预期结果文件（`result-file`）。
+   - 使用管道（`pipe`）和 `fork` 启动测试可执行文件。
+   - 向测试程序发送输入，读取输出，比较结果。
+   - 输出执行时间（以毫秒为单位）。
+
+---
+
+### **关键函数分析**
+1. **Joiner.c**:
+   - `createJoiner` / `destroyJoiner`: 初始化和清理 Joiner 结构。
+   - `setup`: 从标准输入读取关系文件名，加载到内存。
+   - `join`: 协调查询执行，调用列等值、过滤、连接和校验和操作。
+
+2. **Parser.c**:
+   - `parseQuery`: 将查询字符串分解为关系、谓词和选择。
+   - `createQueryEstimations`: 为查询中的关系分配统计信息副本。
+
+3. **Optimizer.c**:
+   - `findStats`: 计算列的统计信息（最小值、最大值、频率、离散值）。
+   - `applyColEqualityEstimations` / `applyFilterEstimations` / `applyJoinEstimations`: 更新统计信息以优化查询。
+
+4. **Vector.c**:
+   - `createVector` / `insertAtVector` / `destroyVector`: 管理动态向量。
+   - `scanColEquality` / `scanFilter`: 执行列等值和过滤操作。
+
+5. **Partition.c**:
+   - `partition`: 执行 Radix Hash Join 的分区阶段，分配数据到桶。
+   - `histFunc` / `partitionFunc`: 并行计算直方图和分区。
+
+6. **Build.c**:
+   - `build`: 为较小关系构建哈希表。
+   - `buildFunc`: 并行构建每个桶的索引。
+
+7. **Probe.c**:
+   - `joinFunc`: 执行探查，查找匹配的元组并构造结果。
+   - `constructTuple`: 合并左右关系的元组。
+
+8. **JobScheduler.c**:
+   - `createJobScheduler`: 初始化线程池和任务队列。
+   - `threadFunc`: 线程主循环，从队列获取任务并执行。
+   - `destroyJobScheduler`: 清理线程池和资源。
+
+9. **Intermediate.c**:
+   - `createInterMetaData`: 初始化中间结果结构。
+   - `applyColumnEqualities` / `applyFilters` / `applyJoins`: 执行查询操作。
+   - `applyCheckSums`: 计算并输出校验和。
+
+---
+
+### **性能优化**
+1. **并行化**：
+   - 使用多线程并行处理分区、构建、探查和校验和计算。
+   - 任务队列和条件变量确保高效的任务分配和同步。
+
+2. **内存管理**：
+   - 使用 `mmap` 高效加载关系数据。
+   - 使用 `posix_memalign` 确保内存对齐，提高性能。
+   - 动态向量支持自动扩展，减少内存浪费。
+
+3. **查询优化**：
+   - 基于统计信息估算中间结果大小，减少不必要的计算。
+   - Radix Hash Join 算法通过分区减少内存需求和冲突。
+
+4. **Radix Hash Join**：
+   - 使用两级哈希（`HASH_FUN_1` 和 `HASH_FUN_2`）减少冲突。
+   - 根据关系大小动态选择构建和探查的角色。
+
+---
+
+### **代码中的潜在问题**
+1. **注释掉的优化**：
+   - `findOptimalJoinOrder` 函数被注释，可能未实现完整的连接顺序优化，可能导致次优性能。
+
+2. **错误处理**：
+   - 内存分配失败（`MALLOC_CHECK`）会导致程序直接退出，可能需要更细致的错误恢复机制。
+   - 文件操作（如 `mmap` 和 `open`）的错误处理较为简单，可能需要更健壮的处理。
+
+3. **并行化开关**：
+   - `PARALLEL_PARTITION` 和 `PARALLEL_HISTOGRAM` 宏被设置为 0，禁用并行分区和直方图计算，可能影响性能。
+
+4. **硬编码参数**：
+   - 线程数（`THREAD_NUM`）固定为 4，可能需要动态调整以适应不同硬件。
+   - `RADIX_BITS` 和 `HASH_RANGE_1` 根据平均元组数设置，可能需要更灵活的配置。
+
+5. **内存泄漏风险**：
+   - 尽管大多数资源在 `destroy` 函数中释放，但复杂的数据结构（如 `InterMetaData`）可能存在遗漏释放的风险。
+
+---
+
+### **改进建议**
+1. **实现连接顺序优化**：
+   - 完善 `findOptimalJoinOrder`，使用动态规划或贪心算法选择最优连接顺序。
+
+2. **动态线程数**：
+   - 根据硬件核心数动态设置 `THREAD_NUM`，提高并行效率。
+
+3. **启用并行分区**：
+   - 将 `PARALLEL_PARTITION` 和 `PARALLEL_HISTOGRAM` 设置为 1，测试并行性能。
+
+4. **错误处理**：
+   - 增加更细致的错误处理机制，如记录日志或优雅退出。
+
+5. **内存优化**：
+   - 使用内存池或缓存重用来减少频繁的 `malloc` 和 `free` 开销。
+
+6. **配置文件**：
+   - 将硬编码参数（如 `RADIX_BITS`, `initSize`）移到配置文件，增加灵活性。
+
+---
+
+### **总结**
+这段程序是一个高效的数据库查询引擎实现，结合了 Radix Hash Join 算法、多线程并行化和统计优化，适合处理大规模关系数据库查询。代码结构清晰，模块化设计良好，但存在一些未完成的部分（如连接顺序优化）和潜在的性能瓶颈（如固定线程数）。通过完善优化算法和动态配置参数，可以进一步提升性能和健壮性。
+
+如果你有具体问题或需要深入分析某个部分，请告诉我！
