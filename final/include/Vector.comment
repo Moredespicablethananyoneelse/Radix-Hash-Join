@@ -1,0 +1,43 @@
+2. 结构定义
+Vector 的定义如下（来自 Vector.h）：
+cstruct Vector
+{
+    unsigned *table;        // 存储所有元组的扁平数组
+    unsigned tupleSize;      // 每个元组的大小（row ID 数量）
+    unsigned nextPos;       // 下一个插入位置，同时作为 row ID 计数器
+    unsigned capacity;      // 表的最大容量（row ID 数量）
+};
+
+unsigned *table：
+
+动态分配的数组，存储所有元组的 row ID。
+采用扁平存储：例如，若 tupleSize=2，存储元组 <1,2>, <3,4>，则 table = [1,2,3,4]。
+优点：连续内存布局提高缓存命中率，便于快速 memcpy 和扫描。
+
+
+unsigned tupleSize：
+
+表示每个元组包含的 row ID 数量。例如，单表查询可能 tupleSize=1，而多表 join 可能 tupleSize=3（每个表贡献一个 row ID）。
+一旦设置，通常不变，决定了 table 中数据的逻辑分组。
+
+
+unsigned nextPos：
+
+双重作用：
+
+插入指针：指向 table 中下一个空闲位置（以 row ID 为单位）。
+计数器：记录当前存储的 row ID 总数。元组数 = nextPos / tupleSize。
+
+
+例如，插入 3 个元组，tupleSize=2，则 nextPos=6。
+
+
+unsigned capacity：
+
+table 的最大容量（以 row ID 为单位）。
+当 nextPos >= capacity 时，通过 realloc 扩展容量（通常翻倍）。
+
+
+
+此外，全局变量 unsigned initSize（在 Joiner.c 的 setVectorInitSize 中设置）决定了初始容量，基于关系的平均元组数（如 1000、5000 或 500000）。
+************************************************
