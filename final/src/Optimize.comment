@@ -229,3 +229,219 @@ void findStats(uint64_t *column, struct columnStats *stat, unsigned columnSize)
 这个函数完美体现了数据库系统中**空间-时间权衡**的设计哲学，用适度的内存开销换取了高效的统计信息收集能力。
 
 ********************************************88
+
+我来逐行详细解释这个重要的统计信息更新函数：
+
+```c
+void applyColEqualityEstimations(struct QueryInfo *q, struct Joiner *j)
+{
+```
+
+**函数声明**：处理同一关系内的列相等条件统计估算。
+
+```c
+    for(unsigned i = 0 ; i < q->numOfPredicates; ++i)
+    {
+```
+
+**遍历所有谓词**：检查每个查询条件。
+
+```c
+        unsigned leftRelId        = getRelId(&q->predicates[i].left);
+        unsigned rightRelId       = getRelId(&q->predicates[i].right);
+        unsigned leftColId        = getColId(&q->predicates[i].left);
+        unsigned rightColId       = getColId(&q->predicates[i].right);
+```
+
+**提取谓词信息**：
+- 左右关系ID和列ID
+- 例如：对于 `employees.salary = employees.bonus`
+
+```c
+        unsigned actualId         = getOriginalRelId(q, &q->predicates[i].left);
+```
+
+**获取实际关系ID**：处理关系别名的情况。
+
+```c
+        struct columnStats *stat1 = &q->estimations[leftRelId][leftColId];
+        struct columnStats *stat2 = &q->estimations[rightRelId][rightColId];
+```
+
+**获取统计信息**：左右列的统计信息指针。
+
+```c
+        struct columnStats *temp;
+```
+
+**临时指针**：用于更新其他列的统计信息。
+
+```c
+        // Same relation - different columns
+        if(isColEquality(&q->predicates[i]) && (leftColId != rightColId))
+        {
+```
+
+**情况1：同一关系内不同列的相等比较**（如：salary = bonus）
+
+```c
+            // Find estimations for the two columns
+            uint64_t newMin;
+            uint64_t newMax;
+            unsigned newF;
+            unsigned newD;
+```
+
+**定义新统计值**：最小值、最大值、频率、离散值数量。
+
+```c
+            newMin = (stat1->minValue > stat2->minValue) ? stat1->minValue : stat2->minValue;
+```
+
+**计算新最小值**：取两个列最小值的较大者（交集的下界）。
+
+```c
+            newMax = (stat1->maxValue < stat2->maxValue) ? stat1->maxValue : stat2->maxValue;
+```
+
+**计算新最大值**：取两个列最大值的较小者（交集的上界）。
+
+```c
+            newF   = stat1->f / (newMax - newMin + 1);
+```
+
+**计算新频率**：基于选择率的估算。
+- 公式：新频率 = 原频率 / 值域范围
+- 假设值均匀分布
+
+```c
+            newD   = stat1->discreteValues * (1-power(1-(newF/stat1->f),stat1->f/stat1->discreteValues));
+```
+
+**计算新离散值数量**：使用概率公式估算。
+- 基于二项分布的概率模型
+- 估算连接后剩余的离散值数量
+
+```c
+            /* Update the statistics of every other column except for the ones taking part in the equality  */
+            for (unsigned c = 0; c < (*(j->relations[actualId])).numOfCols; ++c)
+            {
+```
+
+**更新其他列的统计信息**：遍历关系的所有列。
+
+```c
+                temp = &q->estimations[leftRelId][c];
+                if ((c!=leftColId)  && (c!=rightColId))
+                {
+```
+
+**跳过参与相等的列**：只更新其他列。
+
+```c
+                    /* In case stat1->f or temp->discreteValues is zero */
+                    stat1->f = (stat1->f == 0) ? 1 : stat1->f;
+                    temp->discreteValues = (temp->discreteValues == 0) ? 1 : temp->discreteValues;
+```
+
+**防止除零错误**：确保分母不为零。
+
+```c
+                    temp->discreteValues = temp->discreteValues * (1-power(1-(newF/stat1->f),temp->f/temp->discreteValues));
+```
+
+**更新其他列的离散值数量**：使用概率公式。
+- 基于连接选择率调整其他列的统计信息
+- 反映连接操作对数据分布的影响
+
+```c
+                }
+            }
+```
+
+```c
+            /* Update the statistics for the two columns taking part in the equality */
+            stat1->minValue       = stat2->minValue       = newMin;
+            stat1->maxValue       = stat2->maxValue       = newMax;
+            stat1->f              = stat2->f              = newF;
+            stat1->discreteValues = stat2->discreteValues = newD;
+```
+
+**更新参与列的统计信息**：设置新的最小值、最大值、频率和离散值数量。
+
+```c
+        }
+        // Same relation - same column
+        else if(isColEquality(&q->predicates[i]))
+        {
+```
+
+**情况2：同一关系内同一列的相等比较**（自连接条件）
+
+```c
+            stat1->f = (stat1->f * stat1->f) / (stat1->maxValue - stat1->minValue + 1);
+```
+
+**计算新频率**：自连接的结果集大小估算。
+- 公式：结果数 = (N²) / D （其中N是元组数，D是值域范围）
+- 基于均匀分布假设
+
+```c
+            for (unsigned c = 0; c < (*(j->relations[actualId])).numOfCols; ++c)
+            {
+                temp = &q->estimations[leftRelId][c];
+                if (c!=rightColId)
+                    temp->f = stat1->f;
+            }
+```
+
+**更新其他列的频率**：所有其他列的频率与参与列相同。
+- 因为自连接后所有列的元组数都相同
+
+```c
+        }
+    }
+}
+```
+
+## 关键技术原理
+
+### 1. **统计信息传播**
+当两个列相等时，它们的统计信息会相互影响，需要同步更新。
+
+### 2. **选择率估算公式**
+- **不同列相等**：基于值域交集和概率模型
+- **同一列相等**：基于自连接的数学公式
+
+### 3. **相关性处理**
+更新其他列的统计信息，反映连接操作对整体数据分布的影响。
+
+### 4. **错误处理**
+防止除零错误，确保估算公式的稳定性。
+
+## 实际示例
+
+### 示例1：不同列相等
+```sql
+-- employees.salary = employees.bonus
+-- stat1: salary统计 (min=1000, max=10000, f=1000, D=100)
+-- stat2: bonus统计 (min=500, max=8000, f=1000, D=80)
+
+-- 计算结果：
+-- newMin = max(1000,500) = 1000
+-- newMax = min(10000,8000) = 8000  
+-- newF = 1000 / (8000-1000+1) ≈ 0.143
+-- newD ≈ 100 * (概率公式计算结果)
+```
+
+### 示例2：同一列相等
+```sql
+-- employees.id = employees.id (自连接)
+-- stat1: id统计 (min=1, max=1000, f=1000, D=1000)
+
+-- 计算结果：
+-- newF = (1000 * 1000) / (1000-1+1) = 1000
+```
+
+这个函数体现了数据库优化器中复杂的统计信息维护机制，确保在执行计划生成时拥有准确的代价估算基础。
+********************************************************
