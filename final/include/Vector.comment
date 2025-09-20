@@ -68,3 +68,141 @@ tupleSize 表示每个元组（tuple）包含的 row ID 数量，而不是字节
 如果只写 malloc((*vector)->capacity)，只会分配 100 字节，导致内存不足，可能会引发未定义行为（如内存越界或程序崩溃）。
 
 因此，(*vector)->capacity * sizeof(unsigned) 是为了确保分配的内存大小能够容纳 capacity 个 unsigned 类型的元素。
+***********************************************************************************
+感谢您的提问！让我详细解释 `scanColEquality` 函数的代码逻辑、设计目的、实现细节以及在数据库查询处理系统中的作用。我会结合代码逐行分析，确保清晰且全面地回答您的问题，同时融入上下文（例如 `Vector` 的结构和数据库查询的背景）。
+
+---
+
+### 1. 函数签名与功能概述
+函数定义：
+```c
+void scanColEquality(struct Vector *new, struct Vector *old, uint64_t *leftCol, uint64_t *rightCol, unsigned posLeft, unsigned posRight)
+{
+	/* Note: Each tuple in old vector contains one rowId */
+	/* Except for the case of join between relations from the same intermediate entity[i.e: vector] */
+	for (unsigned i = 0; i < old->nextPos; i += old->tupleSize)
+		if (leftCol[old->table[i + posLeft]] == rightCol[old->table[i + posRight]])
+			insertAtVector(new, &old->table[i]);
+}
+```
+
+**功能概述**：
+- `scanColEquality` 的作用是检查同一关系（或中间结果）中两列（`leftCol` 和 `rightCol`）的相等性，将满足条件的元组（tuple）从旧 Vector（`old`）复制到新 Vector（`new`）。
+- 具体来说，它扫描 `old` Vector 中的元组，检查每个元组在指定位置（`posLeft` 和 `posRight`）的 row ID 对应的列值是否相等（`leftCol[rowID] == rightCol[rowID]`），如果相等，则将整个元组插入到 `new` Vector 中。
+- 这是一个典型的数据库查询操作，用于处理类似 SQL 中 `WHERE R.A = R.B` 的条件（即检查同一表或中间结果中两列的相等性）。
+
+**典型场景**：
+- **单表查询**：例如，`SELECT * FROM R WHERE R.A = R.B`，检查表 `R` 中列 `A` 和列 `B` 相等的行。
+- **中间结果处理**：在多表查询的中间阶段，检查中间结果中两列的相等性（如在 Radix Hash Join 或其他查询优化步骤中）。
+
+---
+
+### 2. 参数详解
+让我们逐一分析函数的参数：
+1. **`struct Vector *new`**：
+   - 指向目标 Vector，用于存储满足相等条件的元组。
+   - `new` 是一个动态数组，初始可能为空（`table = NULL`, `nextPos = 0`, `capacity = 0`），通过 `insertAtVector` 动态扩展。
+   - `new->tupleSize` 通常与 `old->tupleSize` 相同，因为它继承 `old` 的元组结构。
+
+2. **`struct Vector *old`**：
+   - 指向输入 Vector，包含待检查的元组。
+   - 每个元组由 `old->tupleSize` 个 row ID 组成，存储在 `old->table` 中。
+   - `old->nextPos` 表示已存储的 row ID 总数，元组数 = `nextPos / tupleSize`。
+   - 注释中提到：“Each tuple in old vector contains one rowId”（除了某些特殊情况），表明在大多数场景下，`old->tupleSize = 1`（单表查询），但在连接操作中可能大于 1（例如，`tupleSize = 2` 表示双表连接的中间结果）。
+
+3. **`uint64_t *leftCol`**：
+   - 指向左列的值数组，存储某关系的某列数据（例如，表 `R` 的列 `A`）。
+   - 每个 `leftCol[rowID]` 是一个 64 位整数，表示 row ID 对应的列值。
+
+4. **`uint64_t *rightCol`**：
+   - 指向右列的值数组，存储另一列数据（例如，表 `R` 的列 `B`）。
+   - 通常与 `leftCol` 属于同一关系（单表查询），但在某些情况下可能来自不同关系（中间结果的连接）。
+
+5. **`unsigned posLeft`**：
+   - 指定 `old->table` 中元组的左 row ID 的偏移量。
+   - 例如，若 `tupleSize = 2`，元组为 `<R_rowID, S_rowID>`，`posLeft = 0` 表示检查 `R_rowID`。
+
+6. **`unsigned posRight`**：
+   - 指定 `old->table` 中元组的右 row ID 的偏移量。
+   - 例如，`posRight = 1` 表示检查 `S_rowID`。
+
+---
+
+### 3. 代码逐行分析
+以下是代码的详细分解：
+```c
+for (unsigned i = 0; i < old->nextPos; i += old->tupleSize)
+```
+- **循环逻辑**：
+  - `old->nextPos` 是 `old->table` 中已存储的 row ID 总数。
+  - `i` 表示当前处理的元组在 `table` 中的起始索引（以 row ID 为单位）。
+  - `i += old->tupleSize` 每次跳跃一个元组的长度（`tupleSize` 个 row ID）。
+  - 例如，若 `tupleSize = 2`，`nextPos = 6`，循环会处理 `i = 0, 2, 4`，对应 3 个元组。
+
+```c
+if (leftCol[old->table[i + posLeft]] == rightCol[old->table[i + posRight]])
+```
+- **相等性检查**：
+  - `old->table[i + posLeft]`：获取当前元组中第 `posLeft` 个 row ID。
+    - 例如，若 `i = 0`，`posLeft = 0`，`tupleSize = 2`，`table = [1, 2, 3, 4]`，则 `table[0 + 0] = 1`。
+  - `leftCol[old->table[i + posLeft]]`：使用该 row ID 索引 `leftCol` 获取列值。
+  - 同样，`old->table[i + posRight]` 获取右 row ID，`rightCol[old->table[i + posRight]]` 获取对应的列值。
+  - 检查两列值是否相等：`leftCol[rowID_left] == rightCol[rowID_right]`。
+  - 例如：
+    - 单表：`tupleSize = 1`，`posLeft = 0`，`posRight = 0`，检查同一 row ID 在两列的相等性。
+    - 双表：`tupleSize = 2`，`posLeft = 0`，`posRight = 1`，检查不同表的 row ID 对应的列值。
+
+```c
+insertAtVector(new, &old->table[i]);
+```
+- **插入操作**：
+  - 如果相等性条件满足，将整个元组（从 `old->table[i]` 开始的 `tupleSize` 个 row ID）复制到 `new` Vector。
+  - `insertAtVector` 会：
+    - 检查 `new` 的容量，若不足则通过 `realloc` 扩展（通常翻倍）。
+    - 使用 `memcpy` 复制 `tupleSize` 个 row ID 到 `new->table[new->nextPos]`。
+    - 更新 `new->nextPos += tupleSize`。
+
+---
+
+### 4. 工作流程示例
+假设以下输入：
+- `old->tupleSize = 2`，`old->nextPos = 4`，`old->table = [1, 2, 3, 4]`（2 个元组：`<1, 2>, <3, 4>`）。
+- `leftCol = [10, 20, 30, 40]`，`rightCol = [5, 20, 35, 40]`。
+- `posLeft = 0`，`posRight = 1`（检查元组中第一个 row ID 对应的 `leftCol` 和第二个 row ID 对应的 `rightCol`）。
+
+**执行步骤**：
+1. **循环 i = 0**：
+   - 元组：`<1, 2>`（`table[0] = 1`, `table[1] = 2`）。
+   - `old->table[0 + 0] = 1`，`leftCol[1] = 20`。
+   - `old->table[0 + 1] = 2`，`rightCol[2] = 20`。
+   - `20 == 20`，条件满足，调用 `insertAtVector(new, &old->table[0])`，插入 `[1, 2]` 到 `new`。
+
+2. **循环 i = 2**：
+   - 元组：`<3, 4>`（`table[2] = 3`, `table[3] = 4`）。
+   - `old->table[2 + 0] = 3`，`leftCol[3] = 40`。
+   - `old->table[2 + 1] = 4`，`rightCol[4] = 40`。
+   - `40 == 40`，条件满足，插入 `[3, 4]` 到 `new`。
+
+3. **结果**：
+   - `new->table = [1, 2, 3, 4]`，`new->nextPos = 4`，`new->tupleSize = 2`。
+
+---
+
+### 5. 设计目的与上下文
+`scanColEquality` 是数据库查询引擎中用于处理 **列相等性检查** 的核心函数，常见于以下场景：
+1. **单表列相等性检查**：
+   - SQL 示例：`SELECT * FROM R WHERE R.A = R.B`。
+   - `tupleSize = 1`，`posLeft = 0`，`posRight = 0`。
+   - `old->table` 存储 row ID，检查 `leftCol[rowID] == rightCol[rowID]`。
+   - 例如，`R.A = [10, 20, 30]`，`R.B = [10, 25, 30]`，保留 row ID `0` 和 `2`。
+
+2. **中间结果的列相等性**：
+   - 在多表查询中，`old` Vector 可能存储连接的中间结果（`tupleSize > 1`）。
+   - 例如，`R.A = S.B` 的中间结果，元组为 `<R_rowID, S_rowID>`，检查 `leftCol[R_rowID] == rightCol[S_rowID]`。
+   - 注释中提到“join between relations from the same intermediate entity”，表明可能处理同一中间结果的列比较。
+
+3. **多线程支持**：
+   - `scanColEquality` 通常与 `JobScheduler` 结合，由多个线程并行调用（如 `colEqualityFunc`）。
+   - 每个线程处理 `old` Vector 的子集，输出到独立的 `new` Vector（如 `interResults[pos][i]`）。
+
+
