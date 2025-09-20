@@ -1,0 +1,691 @@
+#ifndef BUILD_H
+#define BUILD_H
+
+#include "Partition.h"/* for "RadixHashJoinInfo" type*/
+
+#define  HASH_RANGE_2 301
+#define  HASH_FUN_2(KEY) ((KEY)%(301))
+
+struct buildArg{
+  unsigned bucket;
+  RadixHashJoinInfo *info;
+};
+
+
+void buildFunc(void* arg);
+void build(RadixHashJoinInfo *infoLeft,RadixHashJoinInfo *infoRight);
+void initializeIndexArray(RadixHashJoinInfo *info);
+void buildIndexPerBucket(RadixHashJoinInfo *info);
+void traverseChain(unsigned chainPos,unsigned* chainArray,unsigned posToBeStored);
+
+#endif  #ifndef INTERMEDIATE_H
+#define INTERMEDIATE_H
+
+#include "Joiner.h"
+#include "Parser.h"
+
+struct InterMetaData
+{
+	/**
+	 * Array arrays of vectors: Each vector-array will be an "intermediate" entity
+	 * We need one array of vectors per "intermediate" entity because we'll be computing
+	 * the intermediate result using many jobs, not just one. Those jobs will be served
+	 * by our threads.
+	 */
+	struct Vector ***interResults;
+
+	/**
+	 * Array of arrays: One array per interResult .
+	 * Each array will be of size "queryRelations"
+	 * It is actually a  mapping between a relation and where its rowIds are placed inside the tuple
+	 * E.g: mapRels[0][1] = 2    means: 0-th vector will contain tuples of the following format:
+	 *
+	 * <rowIdX,rowIdY,rowId1,...> , where X,Y are ids of the joined relations
+	 * 0-th rowId inside tuple is from relation X,
+	 * 1-st rowId inside tuple is from relation Y,
+	 * 2-nd rowId inside tuple is from relation 1,
+	 * e.t.c
+	 *
+	 * In general : mapRels[..][relId] = tupleOffset
+	 */
+	unsigned **mapRels;
+
+	/* Number of relations participating in the query */
+	unsigned queryRelations;
+
+	/* Size of interResults array
+	 * I.e: max number of "intermediate" entities that might be created
+	 */
+	unsigned maxNumOfVectors;
+};
+
+typedef struct ColumnInfo
+{
+	uint64_t *values;
+	unsigned *rowIds;
+	struct Vector *tuples;
+}ColumnInfo;
+
+typedef struct Index
+{
+	/* These are the two arrays
+		used for the indexing of a single bucket */
+	unsigned *chainArray;
+	unsigned *bucketArray;
+}Index;
+
+/**
+ * @brief      Holds info about the relation we are joining
+ */
+typedef struct RadixHashJoinInfo
+{
+
+	unsigned pos;
+	// Id of the relation [relevant to the parse order]
+	unsigned relId;
+
+	// Id of the column
+	unsigned colId;
+
+	// Column values
+	uint64_t *col;
+
+	// Number of tuples [either in original relation or in intermediate vector]
+	unsigned numOfTuples;
+
+	// Number of rowIds in each tuple of the vector
+	// In case the relation is not in the intermediate results,tupleSize won't be used at all.
+	unsigned tupleSize;
+
+	// Intermediate vector
+	// In case the relation is not in the intermediate results,vector won't be used at all.
+	struct Vector **vector;
+
+	// Vector's address [Useful when we want to destroy the vector after having executed the join]
+	struct Vector **ptrToVec;
+
+	// Map[relation <---> vector's tuple]
+	// In case the relation is not in the intermediate results,map won't be used at all.
+	unsigned *map;
+
+	// Map's address [Useful when we want to destroy the map array after having executed the join]
+	unsigned **ptrToMap;
+
+	// Number of relations participating in the query
+	// I.e: size of map array
+	unsigned queryRelations;
+
+	// 1 if relation is in interResults
+	// 0 otherwise
+	unsigned isInInter;
+
+	// Will be set to 1 during build phase, in case this is the small column
+	// between the two columns we're joining.
+	unsigned isSmall;
+	// 1: if it is on join's lhs, 0 otherwise
+	unsigned isLeft;
+
+	ColumnInfo *unsorted;
+	ColumnInfo *sorted;
+	unsigned *hist;
+	unsigned *pSum;
+	Index **indexArray;
+}RadixHashJoinInfo;
+
+/* Creators/Initializers */
+void createInterMetaData(struct InterMetaData **inter,struct QueryInfo *q);
+void initializeInfo(struct InterMetaData *inter,struct QueryInfo *q,struct SelectInfo *s,struct Joiner *j,RadixHashJoinInfo *arg);
+
+/* Apply Functions */
+void applyColumnEqualities(struct InterMetaData *inter,struct Joiner* joiner,struct QueryInfo *q);
+void applyFilters(struct InterMetaData *inter,struct Joiner* joiner,struct QueryInfo *q);
+void applyJoins(struct InterMetaData *inter,struct Joiner* joiner,struct QueryInfo *q);
+void applyProperJoin(struct InterMetaData *inter,RadixHashJoinInfo* argLeft,RadixHashJoinInfo* argRight);
+void applyCheckSums(struct InterMetaData *inter,struct Joiner* joiner,struct QueryInfo *q);
+
+/* Check functions */
+unsigned isInInter(struct Vector *vector);
+
+/* Misc */
+unsigned getVectorPos(struct InterMetaData *inter,unsigned relId);
+unsigned getFirstAvailablePos(struct InterMetaData* inter);
+void createMap(unsigned **mapRels,unsigned size,unsigned *values);
+void printCheckSum(uint64_t checkSum,unsigned iSLast);
+
+/* Destroyer */
+void destroyInterMetaData(struct InterMetaData *inter);
+void destroyRadixHashJoinInfo(RadixHashJoinInfo *);
+void destroyColumnInfo(ColumnInfo **c);
+
+#endif   #ifndef JOB_SCHEDULER_H
+#define JOB_SCHEDULER_H
+
+#include <stdint.h>
+#include <pthread.h>
+
+
+/* Mutexes - conditional variables - barriers */
+extern pthread_mutex_t queueMtx;
+extern pthread_mutex_t jobsFinishedMtx;
+extern pthread_cond_t condNonEmpty;
+extern pthread_cond_t condJobsFinished;
+extern pthread_barrier_t barrier;
+extern struct JobScheduler* js;
+extern unsigned jobsFinished;
+extern pthread_mutex_t* partitionMtxArray;
+
+
+/* Job queue */
+/* It must be visible from all threads, including the main thread of course */
+extern struct Queue* jobQueue;
+
+struct Job{
+  // Function that the worker thread is going to execute
+  void (*function)(void*);
+  // Argument passed to the function
+  void *argument;
+};
+
+struct JobScheduler{
+    // number of worker threads
+    unsigned threadNum;
+    //thread ids
+    pthread_t *tids;
+    // histgrams
+    unsigned **histArray;
+    // checksums
+    uint64_t *checkSumArray;
+
+    // job arrays [different kinds of jobs]
+    struct Job *histJobs;
+    struct Job *partitionJobs;
+    struct Job *buildJobs;
+    struct Job *joinJobs;
+    struct Job *colEqualityJobs;
+    struct Job *filterJobs;
+    struct Job *checkSumJobs;
+};
+
+void createJobScheduler(struct JobScheduler** js);
+void createJobArrays(struct JobScheduler* js);
+void *threadFunc(void *);
+void destroyJobScheduler(struct JobScheduler* js);
+
+#endif   #ifndef JOINER_H
+#define JOINER_H
+
+#include <stdint.h>
+#include "Parser.h"
+
+
+#define  HASH_FUN_1(KEY) ((KEY) & ((1<<RADIX_BITS)-1))
+extern unsigned RADIX_BITS;
+extern unsigned HASH_RANGE_1;
+
+struct QueryInfo;
+
+struct Joiner
+{
+	struct Relation **relations;
+	unsigned numOfRelations;
+};
+
+
+/**
+ * @brief      Creates a new joiner.Also, it initializes
+ *             joiner's members (relations,numOfRelations,capacity)
+ */
+void createJoiner(struct Joiner **joiner);
+
+/**
+ * @brief      Reads filesnames[containing relations to be joined]
+ */
+void setup(struct Joiner *joiner);
+
+/**
+ * @brief      Adds a new relation to the given joiner struct
+ *
+ * @param 	   fileName: The name of the file containing relation's data
+ */
+void addRelation(struct Joiner *joiner,char *fileName);
+
+/**
+ * @brief      Executes the given query and writes
+ *             its result's checksum in stdout.
+ */
+void join(struct Joiner *joiner,struct QueryInfo *q);
+
+unsigned getRelationTuples(struct Joiner *joiner,unsigned relId);
+
+
+uint64_t *getColumn(struct Joiner *joiner,unsigned relId,unsigned colId);
+
+/**
+* @brief      Calls destroyRelation for each relation
+*             Free-s joiner
+*/
+void destroyJoiner(struct Joiner *joiner);
+
+/**
+* Sets the variable RADIX_BITS to an appropriate number according
+* to avg. number of tuples
+*/
+void setRadixBits(struct Joiner* joiner);
+
+/**
+* Sets the variable initSize to an appropriate number according
+* to avg. number of tuples
+*/
+void setVectorInitSize(struct Joiner *joiner);
+
+#endif  #ifndef OPERATIONS_H
+#define OPERATIONS_H
+
+#include "Joiner.h"
+#include "Vector.h"
+#include "Intermediate.h"
+#include "Utils.h"
+
+
+struct filterArg{
+  uint64_t *col;
+  uint64_t constant;
+  Comparison cmp ;
+  unsigned start;
+  unsigned end;
+  struct Vector **vector;
+};
+void filterFunc(void *arg);
+
+
+
+void colEqualityInter(uint64_t *leftCol,uint64_t *rightCol,unsigned posLeft,unsigned posRight,struct Vector **vector);
+void colEquality(uint64_t *leftCol,uint64_t *rightCol,unsigned numOfTuples,struct Vector **vector);
+void filterInter(uint64_t *col,Comparison cmp,uint64_t constant,struct Vector **vector);
+void joinNonInterNonInter(struct InterMetaData *inter,RadixHashJoinInfo* left,RadixHashJoinInfo* right);
+void joinNonInterInter(struct InterMetaData *inter,RadixHashJoinInfo* left,RadixHashJoinInfo* right);
+void joinInterNonInter(struct InterMetaData *inter,RadixHashJoinInfo* left,RadixHashJoinInfo* right);
+void joinInterInter(struct InterMetaData *inter,RadixHashJoinInfo* left,RadixHashJoinInfo* right);
+#endif  #ifndef STAT_H
+#define STAT_H
+
+#include <limits.h>		/* for CHAR_BIT */
+#include "stdint.h"
+
+#include "Parser.h"
+#include "Joiner.h"
+
+#define PRIMELIMIT 49999991
+// #define PRIMELIMIT 1500
+
+
+#define BITMASK(b) (1 << ((b) % CHAR_BIT))
+#define BITSLOT(b) ((b) / CHAR_BIT)
+#define BITSET(v,b) ((v)[BITSLOT(b)] |= BITMASK(b))
+#define BITCLEAR(v,b) ((v)[BITSLOT(b)] &= ~BITMASK(b))
+#define BITTEST(v,b) ((v)[BITSLOT(b)] & BITMASK(b))
+#define BITNSLOTS(nb) ((nb + CHAR_BIT - 1) / CHAR_BIT)
+
+struct columnStats
+{
+	uint64_t minValue;
+	uint64_t maxValue;
+	unsigned f;
+	unsigned discreteValues;
+	char *bitVector;
+	unsigned bitVectorSize;
+	char typeOfBitVector;
+};
+
+void findStats(uint64_t *column, struct columnStats *stat, unsigned columnSize);
+void applyColEqualityEstimations(struct QueryInfo *q, struct Joiner *j);
+void filterEstimation(struct Joiner *j,struct QueryInfo *q,unsigned colId,struct columnStats *stat,unsigned actualRelId,unsigned relId,Comparison cmp,uint64_t constant);
+void applyFilterEstimations(struct QueryInfo *q, struct Joiner *j);
+void applyJoinEstimations(struct QueryInfo *q, struct Joiner *j);
+void findOptimalJoinOrder(struct QueryInfo *q, struct Joiner *j);
+
+
+/* Printing functions */
+void columnPrint(uint64_t *column, unsigned columnSize);
+void printBooleanArray(char *array, unsigned size);
+void printColumnStats(struct columnStats *s);
+
+#endif   #ifndef PARSER_H
+#define PARSER_H
+
+#include <stdint.h>
+#include "Utils.h"
+#include "Joiner.h"
+
+struct Joiner;
+
+struct SelectInfo
+{
+	unsigned relId;
+	unsigned colId;
+};
+
+struct FilterInfo
+{
+	struct SelectInfo filterLhs;
+	enum Comparison comparison;
+	uint64_t constant;
+};
+
+struct PredicateInfo
+{
+	struct SelectInfo left;
+	struct SelectInfo right;
+};
+
+struct QueryInfo
+{
+	unsigned *relationIds;
+	struct PredicateInfo *predicates;
+	struct FilterInfo *filters;
+	struct SelectInfo *selections;
+	unsigned numOfRelationIds;
+	unsigned numOfPredicates;
+	unsigned numOfFilters;
+	unsigned numOfSelections;
+	// One estimation array per relation
+	struct columnStats **estimations;
+};
+
+/**
+ * @brief      Creates a new query structure.
+ *             Subsequently, parseQuery(..) is called.
+ */
+void createQueryInfo(struct QueryInfo **qInfo,char *rawQuery);
+
+/**
+ * @brief      Deallocates any space allocated for qInfo members
+ */
+void destroyQueryInfo(struct QueryInfo *qInfo);
+
+/**
+ * @brief      Parses relation ids <r1> <r2> ...
+ */
+void parseRelationIds(struct QueryInfo *qInfo,char *rawRelations);
+
+/**
+ * @brief      Parses predicates r1.a=r2.b&r1.b=r3.c...
+ */
+void parsePredicates(struct QueryInfo *qInfo,char *rawPredicates);
+
+/**
+ * @brief      Parses selections r1.a r1.b r3.c...
+ */
+void parseSelections(struct QueryInfo *qInfo,char *rawSelections);
+
+/**
+ * @brief      Parses selections [RELATIONS]|[PREDICATES]|[SELECTS]
+ */
+void parseQuery(struct QueryInfo *qInfo,char *rawQuery);
+
+/**
+ * @brief      Determines if predicate is filter
+ *
+ * @param      predicate  The predicate
+ *
+ * @return     True if filter, False otherwise.
+ */
+int isFilter(char *predicate);
+
+void createQueryEstimations(struct QueryInfo *qInfo,struct Joiner * joiner);
+int isColEquality(struct PredicateInfo *pInfo);
+void addFilter(struct FilterInfo *fInfo,char *token);
+void addPredicate(struct PredicateInfo *pInfo,char *token);
+
+/*
+ * "Getter" functions.
+ * Despite having access to each struct's members from anywhere in our program,
+ * we use "getter" functions just to make our code more neat & clean.
+ */
+unsigned getOriginalRelId(struct QueryInfo *qInfo,struct SelectInfo *sInfo);
+unsigned getRelId(struct SelectInfo *sInfo);
+unsigned getColId(struct SelectInfo *sInfo);
+uint64_t getConstant(struct FilterInfo *fInfo);
+Comparison getComparison(struct FilterInfo *fInfo);
+unsigned getNumOfRelations(struct QueryInfo *qInfo);
+unsigned getNumOfFilters(struct QueryInfo *qInfo);
+unsigned getNumOfColEqualities(struct QueryInfo *qInfo);
+unsigned getNumOfJoins(struct QueryInfo *qInfo);
+
+void printTest(struct QueryInfo *qInfo);
+#endif  #ifndef PARTITION_H
+#define PARTITION_H
+
+#include <stdint.h>
+#include "Intermediate.h"/*for RadixHashJoinInfo type*/
+
+struct histArg{
+  unsigned start;
+  unsigned end;
+  uint64_t *values;
+  unsigned *histogram;
+};
+
+struct partitionArg{
+  unsigned start;
+  unsigned end;
+  unsigned *pSumCopy;
+  RadixHashJoinInfo *info;
+};
+
+void histFunc(void*);
+void partitionFunc(void*);
+void partition(RadixHashJoinInfo*);
+
+#endif   #ifndef PROBE_H
+#define PROBE_H
+#include "Vector.h"
+#include "Partition.h"
+
+
+struct joinArg{
+  unsigned bucket;
+  RadixHashJoinInfo *left;
+  RadixHashJoinInfo *right;
+  struct Vector *results;
+};
+void joinFunc(void *arg);
+
+
+/**
+ * @brief      Checks for equality between the two column values and inserts to the
+ *             results vector a tuple constructed from the two tuples [one from each column]
+ *
+ * @param      small         The small column [has been indexed]
+ * @param      big           The big column   [non-indexed]
+ * @param[in]  i             Row for the big column
+ * @param[in]  start         Starting position of the small column's bucket
+ * @param[in]  searchValue   The search value
+ * @param[in]  pseudoRow     The bucket row [will use it to construct the original row]
+ * @param      results       The results vector
+ * param[in]   tupleToInsert We'll fill it using constructTuple and then we'll add it to results vector
+ */
+void checkEqual(RadixHashJoinInfo *small,RadixHashJoinInfo *big,unsigned i,unsigned start,unsigned searchValue,unsigned pseudoRow,struct Vector *results,unsigned *tupleToInsert);
+
+void probe(RadixHashJoinInfo *left,RadixHashJoinInfo *right,struct Vector *results);
+void constructTuple(RadixHashJoinInfo *small,RadixHashJoinInfo *big,unsigned actualRow,unsigned i,unsigned *tuple);
+
+#endif #ifndef QUEUE_H
+#define QUEUE_H
+
+struct Queue
+{
+	/* Start and end of queue */
+	int front;
+	int rear;
+
+	/* Fixed size of array */
+	int size;
+	void **array;
+};
+
+/* Creates the queue */
+void createQueue(struct Queue **q, int size);
+
+/* Free the allocated memory of the data structure */
+void destroyQueue(struct Queue *q);
+
+/* enQueue an item returns 1 on success */
+int enQueue(struct Queue *q, void* item);
+
+/* always extract from front  returns item on success */
+void* deQueue(struct Queue *q);
+
+int isEmpty(struct Queue *q);
+
+/* display queue and front and rear */
+void display(struct Queue *q);
+
+
+#endif  #ifndef RELATION_H
+#define RELATION_H
+
+#include <stdint.h>
+
+
+struct Relation
+{
+	unsigned numOfTuples;
+	unsigned numOfCols;
+	uint64_t **columns;
+	struct columnStats *stats;
+};
+
+
+/**
+ * @brief   	Creates a new relation and calls
+ *           	loadRelation() to retrieve relation's data.
+ */
+void createRelation(struct Relation **rel,char *fileName);
+
+
+/**
+ * @brief      mmap-s relation's data from the given file
+ */
+void loadRelation(struct Relation *rel,char *fileName);
+
+/**
+ * @brief      Typical printing function
+ */
+void printRelation(struct Relation *rel);
+
+/**
+ * @brief      Dumps relation to the given file
+ */
+void dumpRelation(struct Relation *rel,char *fileName);
+
+/**
+ * @brief    	Free-s any allocated space
+ */
+void destroyRelation(struct Relation *rel);
+
+#endif   #ifndef UTILS_H
+#define UTILS_H
+
+#include <stdint.h>/* uint64_t */
+#define BUFFERSIZE 512
+
+#define MALLOC_CHECK(M)                                                         \
+    if(!M){                                                                     \
+        fprintf(stderr,"[ERROR] MALLOC_CHECK: %s : %d\n", __FILE__, __LINE__);  \
+        exit(EXIT_FAILURE);                                                     \
+    }
+
+
+typedef enum Comparison { Less='<', Greater='>', Equal='=' } Comparison;
+
+int compare(uint64_t key,Comparison cmp,uint64_t constant);
+
+/* Power functions */
+uint64_t power(uint64_t base, uint64_t exponent);
+uint64_t linearPower(uint64_t base, uint64_t exponent);
+
+#endif   #ifndef VECTOR_H
+#define VECTOR_H
+#include <stdint.h>
+
+#include "Utils.h" /*Comparison type*/
+#include "Intermediate.h" /*RadixHashJoinInfo type*/
+
+extern unsigned initSize;
+
+struct Vector
+{
+	/* Table with tuples */
+	unsigned *table;
+
+	/* Size of tuple (i.e: rowids per tuple) */
+	unsigned tupleSize;
+
+	/* Position where the next tuple will be inserted
+	 * This member also acts as a counter for the vector elements
+	 * i.e:for the rowIds stored in the vector
+	 */
+	unsigned nextPos;
+
+	/* Max capacity[i.e: number of rowIds] of the table */
+	/* If needed, we'll double it using realloc(..) */
+	unsigned capacity;
+};
+
+struct checkSumArg{
+	struct Vector *vector;
+	uint64_t *col;
+	unsigned rowIdPos;
+	uint64_t *sum;
+};
+void checkSumFunc(void *arg);
+
+struct colEqualityArg{
+	struct Vector *new;
+	struct Vector* old;
+	uint64_t *leftCol;
+	uint64_t* rightCol;
+	unsigned posLeft;
+	unsigned posRight;
+};
+void colEqualityFunc(void *arg);
+
+
+
+/* Creators/Destroyer */
+void createVector(struct Vector **vector,unsigned tupleSize);
+/**
+ * @brief      Creates a vector fixed size.
+ *
+ * @param      vector     The vector
+ * @param[in]  tupleSize  The tuple size
+ * @param[in]  fixedSize  The number of tuples that will be stored in it
+ */
+void createVectorFixedSize(struct Vector **vector,unsigned tupleSize,unsigned fixedSize);
+void destroyVector(struct Vector **vector);
+
+/* Insert functions. No reason for delete function.*/
+void insertAtVector(struct Vector *vector,unsigned *tuple);
+void insertAtPos(struct Vector *vector,unsigned *tuple,unsigned offset);
+
+
+/* Getter functions */
+unsigned getVectorTuples(struct Vector *vector);
+unsigned getTupleSize(struct Vector *vector);
+unsigned *getTuple(struct Vector *vector,unsigned i);
+
+/* Scan functions [Used in the case of an intermediate relation]*/
+void scanColEquality(struct Vector *new,struct Vector* old,uint64_t *leftCol,uint64_t* rightCol,unsigned posLeft,unsigned posRight);
+void scanFilter(struct Vector *new,struct Vector* old,uint64_t *col,Comparison cmp,uint64_t constant);
+void scanJoin(RadixHashJoinInfo *joinRel);
+
+int vectorIsFull(struct Vector *vector);
+int vectorIsEmpty(struct Vector *vector);
+
+void printVector(struct Vector *vector);
+void printTuple(struct Vector *vector,unsigned pos);
+uint64_t checkSum(struct Vector *vector,uint64_t *col,unsigned rowIdPos);
+
+
+#endif 能不能详细解释下Vector的结构的定义和用途
