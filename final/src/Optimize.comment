@@ -1,0 +1,231 @@
+我来逐行详细解释 `findStats` 函数的实现：
+
+```c
+void findStats(uint64_t *column, struct columnStats *stat, unsigned columnSize)
+{
+```
+
+**函数声明**：接受一个数据列指针、统计信息结构体指针和列大小。
+
+```c
+    /* Find MIN and MAX */
+    uint64_t min = column[0];
+    uint64_t max = column[0];
+```
+
+**初始化**：将第一个元素同时设为最小值和最大值的初始值。
+
+```c
+    for (unsigned i = 1; i < columnSize; ++i)
+    {
+```
+
+**遍历循环**：从第二个元素开始遍历整个列。
+
+```c
+        if (column[i] > max)
+            max = column[i];
+```
+
+**更新最大值**：如果当前元素大于当前最大值，更新最大值。
+
+```c
+        if (column[i] < min)
+            min = column[i];
+```
+
+**更新最小值**：如果当前元素小于当前最小值，更新最小值。
+
+```c
+    }
+```
+
+**结束最小值最大值查找循环**。
+
+```c
+    /* Find discrete values */
+    unsigned nbits  = (max - min + 1 > PRIMELIMIT) ? PRIMELIMIT : max - min + 1;
+```
+
+**计算位向量大小**：
+- `max - min + 1`：数据范围的大小
+- 如果范围大于 `PRIMELIMIT`（49,999,991），使用 `PRIMELIMIT`
+- 否则使用实际范围大小
+
+```c
+    stat->bitVector = calloc(BITNSLOTS(nbits), CHAR_BIT);
+```
+
+**分配位向量内存**：
+- `BITNSLOTS(nbits)`：计算需要的字节数（⌈nbits/8⌉）
+- `calloc`：分配并清零内存，所有位初始为0
+- `CHAR_BIT`：通常是8（一个字节的位数）
+
+```c
+    MALLOC_CHECK(stat->bitVector);
+```
+
+**内存分配检查**：确保内存分配成功（应该是自定义的宏）。
+
+```c
+    stat->discreteValues = 0;
+```
+
+**初始化离散值计数器**：从0开始计数。
+
+```c
+    /* Find the way to fill the boolean array depending on its size relative to PRIMELIMIT */
+    if (nbits != PRIMELIMIT)
+    {
+```
+
+**情况1：直接映射**：当数据范围不大时（≤ PRIMELIMIT）。
+
+```c
+        stat->typeOfBitVector = 0;
+```
+
+**设置位向量类型**：0表示直接映射。
+
+```c
+        for (unsigned i = 0; i < columnSize; ++i)
+        {
+```
+
+**遍历所有数据元素**。
+
+```c
+            if(BITTEST(stat->bitVector,column[i]-min) == 0)
+                (stat->discreteValues)++;
+```
+
+**检查并计数离散值**：
+- `BITTEST`：检查位是否已设置
+- 如果位为0，说明这个值是第一次出现，增加离散值计数
+
+```c
+            BITSET(stat->bitVector,column[i]-min);
+```
+
+**设置位**：标记这个值已经出现过。
+- `column[i]-min`：将值映射到0-based索引
+
+```c
+        }
+```
+
+**结束直接映射的循环**。
+
+```c
+    }
+    else
+    {
+```
+
+**情况2：哈希映射**：当数据范围很大时（> PRIMELIMIT）。
+
+```c
+        stat->typeOfBitVector = 1;
+```
+
+**设置位向量类型**：1表示哈希映射。
+
+```c
+        for (unsigned i = 0; i < columnSize; ++i)
+        {
+```
+
+**遍历所有数据元素**。
+
+```c
+            if(BITTEST(stat->bitVector,(column[i]-min) % PRIMELIMIT) == 0)
+                (stat->discreteValues)++;
+```
+
+**检查并计数离散值（哈希版本）**：
+- `(column[i]-min) % PRIMELIMIT`：使用模运算进行哈希映射
+- 检查哈希后的位是否已设置
+
+```c
+            BITSET(stat->bitVector,(column[i]-min) % PRIMELIMIT);
+```
+
+**设置位（哈希版本）**：标记这个哈希值已经出现过。
+
+```c
+        }
+```
+
+**结束哈希映射的循环**。
+
+```c
+    }
+```
+
+**结束位向量填充的if-else块**。
+
+```c
+    /* Assign the remaining values to the stats*/
+    stat->minValue      = min;
+```
+
+**设置最小值**。
+
+```c
+    stat->maxValue      = max;
+```
+
+**设置最大值**。
+
+```c
+    stat->f             = columnSize;
+```
+
+**设置频率**：列中的元素总数。
+
+```c
+    stat->bitVectorSize = nbits;
+```
+
+**设置位向量大小**：实际使用的位数量。
+
+```c
+}
+```
+
+**函数结束**。
+
+## 关键技术点详解
+
+### 位操作宏的工作方式：
+
+```c
+#define BITMASK(b) (1 << ((b) % CHAR_BIT))
+// 示例：b=10, CHAR_BIT=8 → 1 << (10%8=2) → 1<<2 = 4 (00000100)
+
+#define BITSLOT(b) ((b) / CHAR_BIT)  
+// 示例：b=10, CHAR_BIT=8 → 10/8=1 (第二个字节)
+
+#define BITSET(v,b) ((v)[BITSLOT(b)] |= BITMASK(b))
+// 设置第b位：v[1] |= 4
+
+#define BITTEST(v,b) ((v)[BITSLOT(b)] & BITMASK(b))
+// 测试第b位：v[1] & 4
+```
+
+### 内存使用示例：
+
+如果 `nbits = 1000`：
+- `BITNSLOTS(1000) = ⌈1000/8⌉ = 125` 字节
+- 只需要125字节就能跟踪1000个不同的值
+
+### 哈希冲突处理：
+
+当使用哈希映射时，不同的原始值可能映射到同一位：
+- 值1000和值1000+PRIMELIMIT都会映射到同一位
+- 这会导致离散值计数偏小（保守估计）
+- 但由于PRIMELIMIT很大（49M），冲突概率很低
+
+这个函数完美体现了数据库系统中**空间-时间权衡**的设计哲学，用适度的内存开销换取了高效的统计信息收集能力。
+
+********************************************88
