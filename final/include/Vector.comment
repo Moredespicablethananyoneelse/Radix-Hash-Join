@@ -41,3 +41,30 @@ table 的最大容量（以 row ID 为单位）。
 
 此外，全局变量 unsigned initSize（在 Joiner.c 的 setVectorInitSize 中设置）决定了初始容量，基于关系的平均元组数（如 1000、5000 或 500000）。
 ************************************************
+void createVectorFixedSize(struct Vector **vector, unsigned tupleSize, unsigned fixedSize)
+{
+    *vector = malloc(sizeof(struct Vector)); // 分配 Vector 结构体的内存
+    MALLOC_CHECK(*vector);
+    (*vector)->capacity = tupleSize * fixedSize; // 设置容量为 row ID 总数
+    (*vector)->tupleSize = tupleSize; // 设置每个元组的 row ID 数量
+    (*vector)->table = malloc((*vector)->capacity * sizeof(unsigned)); // 分配 table 数组
+    MALLOC_CHECK((*vector)->table);
+    (*vector)->nextPos = 0; // 初始化插入位置
+}
+中tupleSize 表示每个元组（tuple）包含的 row ID 数量，而不是字节大小。
+tupleSize 表示每个元组（tuple）包含的 row ID 数量，而不是字节大小。
+
+在数据库查询中，元组通常表示查询结果的一行，可能包含一个或多个 row ID（对应不同表的记录索引）。
+单表场景：如过滤操作（R.A > 100），每个元组只包含一个表的 row ID，因此 tupleSize = 1。
+多表场景：如连接操作（R.A = S.B），每个元组包含两个表的 row ID，因此 tupleSize = 2（例如，<R_rowID, S_rowID>）。
+
+函数中为什么	(*vector)->table     = malloc((*vector)->capacity *sizeof(unsigned));
+中(*vector)->capacity要乘以sizeof (unsigned),难道不应该就是(*vector)->capacity么
+1. 为什么需要乘以 sizeof(unsigned)？
+在 C 语言中，malloc 函数分配的内存是以**字节（bytes）**为单位的，而 (*vector)->capacity 表示的是 Vector 中能够存储的 unsigned 类型的元素数量（以 row ID 为单位）。每个 unsigned 类型（通常是 unsigned int）占用一定的字节数（例如，在大多数 32 位或 64 位系统中，unsigned int 占用 4 字节）。因此，为了分配足够的内存来存储 capacity 个 unsigned 元素，必须将 capacity 乘以每个 unsigned 元素的大小，即 sizeof(unsigned)。
+如果不乘以 sizeof(unsigned)，malloc 只会分配 capacity 字节的内存，这不足以存储 capacity 个 unsigned 元素。例如：
+
+如果 capacity = 100，而 sizeof(unsigned) = 4（字节），需要的内存是 100 * 4 = 400 字节。
+如果只写 malloc((*vector)->capacity)，只会分配 100 字节，导致内存不足，可能会引发未定义行为（如内存越界或程序崩溃）。
+
+因此，(*vector)->capacity * sizeof(unsigned) 是为了确保分配的内存大小能够容纳 capacity 个 unsigned 类型的元素。
