@@ -525,3 +525,229 @@ probe(&index, values, rowIds, 10, 4);
 - 探测阶段利用 `Index` 快速查找匹配值，生成连接结果。
 
 如果你需要进一步分析 `Index` 在你的代码中的具体实现（如某个函数的逻辑），或希望我模拟更复杂的数据集来展示其工作过程，请告诉我！
+**************************************************************************************
+修正 interResults 和 mapRels 的描述
+感谢你的再次指正！在之前的文档中，我错误地将 interResults 描述为“二维数组”，应为三维数组，并对 mapRels 的语义描述不准确，称 mapRels[i][j] 为“第 i 个中间结果中第 j 个元组（或元组中的第 j 个行ID）对应的原始关系ID”，而正确描述应为“第 i 个中间结果中第 j 个关系对应的在元组中的序号”。此外，示例中 interResults[3][0] 的描述虽未越界，但需与新的 mapRels 语义保持一致。以下是修正后的详细解释，结合 createInterMetaData 函数的代码和上下文，准确描述 interResults 和 mapRels 的设计和用途。
+
+interResults 的描述
+根据 createInterMetaData 函数的代码：
+(*inter)->interResults = malloc((*inter)->maxNumOfVectors * sizeof(struct Vector**));
+for (unsigned i = 0; i < (*inter)->maxNumOfVectors; ++i) {
+    (*inter)->interResults[i] = malloc(HASH_RANGE_1 * sizeof(struct Vector*));
+    for (unsigned v = 0; v < HASH_RANGE_1; ++v)
+        (*inter)->interResults[i][v] = NULL;
+}
+
+
+interResults 的类型：interResults 被声明为 struct Vector ***，这是一个指向指针的指针的指针，表明它是一个三维数组。
+分配过程：
+第一层：interResults 是一个大小为 maxNumOfVectors 的数组，索引范围为 0 到 maxNumOfVectors-1，元素类型为 struct Vector**。
+第二层：interResults[i] 是一个大小为 HASH_RANGE_1 的数组，索引范围为 0 到 HASH_RANGE_1-1，元素类型为 struct Vector*。
+第三层：interResults[i][v] 是一个指向 struct Vector 的指针，表示具体的向量对象，存储元组数据。
+
+
+结构表示：interResults 是一个三维数组，逻辑上可表示为 interResults[i][v][t]，其中：
+i：第 i 个中间结果（对应某个查询操作，如过滤或连接）。
+v：第 v 个分区（对应基数散列连接的分区）。
+t：向量中的第 t 个元组（struct Vector 内部存储的行ID或其他数据）。
+
+
+
+
+为什么 interResults 是三维数组？
+interResults 的三维设计与基数散列连接（Radix Hash Join）的分区机制和中间结果管理密切相关：
+
+第一维 (maxNumOfVectors)：
+表示查询中可能生成的中间结果数量，由 getNumOfFilters(q) + getNumOfColEqualities(q) + getNumOfJoins(q) 计算。
+每个中间结果对应一个查询操作的输出，例如一个过滤操作或一个连接操作。
+
+
+第二维 (HASH_RANGE_1)：
+表示每个中间结果被分区（partitioned）后的子集数量，通常对应基数散列连接的分区数（由 HASH_RANGE_1 定义，例如 2^bits）。
+每个分区存储一部分元组，支持并row processing。
+
+
+第三维 (struct Vector)：
+每个 interResults[i][v] 指向一个 struct Vector，该向量存储具体的元组数据（例如行ID或值）。
+struct Vector 本身可能是一个动态数组，包含多个元组。
+
+
+
+这种三维结构允许系统高效地组织和管理复杂的查询结果，尤其是在多表连接和并行处理场景中。
+
+interResults 的初始化和用途
+在 createInterMetaData 函数中，interResults 的初始化过程如下：
+
+分配：
+interResults 是一个大小为 maxNumOfVectors 的数组，元素为 struct Vector**。
+每个 interResults[i] 是一个大小为 HASH_RANGE_1 的数组，元素为 struct Vector*。
+每个 interResults[i][v] 初始化为 NULL，后续在查询执行（如分区或连接）时动态分配并填充具体的 struct Vector。
+
+
+用途：
+interResults[i][v] 存储第 i 个中间结果的第 v 个分区的元组数据。
+在基数散列连接中，分区阶段使用 RadixHashJoinInfo 的 hist 和 pSum 将数据分配到 HASH_RANGE_1 个分区，每个分区对应一个 struct Vector，存储在 interResults[i][v] 中。
+
+
+
+
+mapRels 的正确描述
+根据 createInterMetaData 函数的代码：
+(*inter)->mapRels = malloc((*inter)->maxNumOfVectors * sizeof(unsigned*));
+MALLOC_CHECK((*inter)->mapRels);
+for (unsigned i = 0; i < (*inter)->maxNumOfVectors; ++i) {
+    (*inter)->mapRels[i] = NULL;
+}
+
+
+mapRels 的类型：mapRels 被声明为 unsigned **，这是一个指向 unsigned 指针的数组，表明它是一个二维数组。
+分配过程：
+第一层：mapRels 是一个大小为 maxNumOfVectors 的数组，索引范围为 0 到 maxNumOfVectors-1，元素类型为 unsigned *。
+第二层：mapRels[i] 是一个指向 unsigned 数组的指针，初始为 NULL，在查询执行中动态分配。
+
+
+结构表示：mapRels 是一个二维数组，mapRels[i][j] 表示第 i 个中间结果中第 j 个关系（relation，索引从 0 到 queryRelations-1）对应的在元组（tuple）中的序号（index）。
+
+
+为什么 mapRels 是二维数组？
+mapRels 的二维设计用于为每个中间结果维护一个映射数组，记录每个关系在元组中的位置序号：
+
+第一维 (maxNumOfVectors)：
+对应查询中可能生成的中间结果数量，匹配 interResults 的第一维。
+每个 mapRels[i] 对应第 i 个中间结果。
+
+
+第二维 (动态分配)：
+mapRels[i] 是一个动态分配的数组，大小通常为 queryRelations（查询中的关系总数）。
+每个 mapRels[i][j] 存储一个序号，表示第 j 个关系（例如，R0 为 j=0，R1 为 j=1）的行ID在元组中的位置索引。
+
+
+
+
+mapRels 的初始化和用途
+
+初始化：
+在 createInterMetaData 中，mapRels[i] 初始化为 NULL，表示尚未分配映射数组。
+在查询执行（如过滤或连接操作）时，mapRels[i] 动态分配为一个大小为 queryRelations 的 unsigned 数组，存储每个关系在元组中的位置序号。
+
+
+用途：
+跟踪关系位置：mapRels[i][j] 记录第 i 个中间结果中第 j 个关系在元组中的序号。例如，若元组为 (rowId_R0, rowId_R1)，则 mapRels[i][0] = 0（R0 的行ID在第0位），mapRels[i][1] = 1（R1 的行ID在第1位）。
+支持连接操作：在基数散列连接中，mapRels 与 interResults 配合，记录分区向量中元组的结构。
+内存管理：mapRels[i] 初始为 NULL，允许按需分配，减少内存浪费；在连接完成后可通过 RadixHashJoinInfo::ptrToMap 释放。
+支持复杂查询：确保多表连接中能够追踪每个关系的行ID在元组中的位置，便于后续操作（如投影或进一步连接）。
+
+
+
+
+示例场景（结合三维和二维结构）
+假设查询 q 的配置如下：
+
+maxNumOfVectors = 4（2个过滤、1个列等值、1个连接）。
+分区数 HASH_RANGE_1 = 4（例如，4个分区）。
+查询涉及 3 个关系（R0, R1, R2），getNumOfRelations(q) = 3。
+
+调用 createInterMetaData(&inter, q) 后：
+
+interResults：一个三维数组，结构为 interResults[4][4]，索引范围为 i = 0..3，v = 0..3，每个 interResults[i][v] 是一个 struct Vector*，初始为 NULL。
+mapRels：一个二维数组，结构为 mapRels[4]，索引范围为 i = 0..3，每个 mapRels[i] 初始为 NULL。
+queryRelations：设为 3，表示查询涉及 3 个关系。
+
+查询执行示例
+假设执行一个连接操作（R0.a = R1.b），生成第4个中间结果（索引 i=3）。连接结果包含以下元组，分配到不同的分区（存储在 interResults[3][v] 的向量中）：
+
+
+
+元组索引
+分区
+元组内容 (行ID)
+元组结构
+
+
+
+0
+0
+(100, 200)
+(R0, R1)
+
+
+1
+0
+(101, 201)
+(R0, R1)
+
+
+2
+2
+(102, 202)
+(R0, R1)
+
+
+
+分配 interResults[3]：
+interResults[3][0] 分配一个 struct Vector，存储分区0的元组 [(100, 200), (101, 201)]。
+interResults[3][2] 分配一个 struct Vector，存储分区2的元组 [(102, 202)]。
+interResults[3][1] 和 interResults[3][3] 保持为 NULL（假设分区1和3无元组）。
+索引验证：i=3 在 maxNumOfVectors=4 内，v=0 和 v=2 在 HASH_RANGE_1=4 内，访问 interResults[3][0] 和 interResults[3][2] 均不越界。
+
+
+分配 mapRels[3]：
+mapRels[3] 分配为一个大小为 queryRelations=3 的数组 [0, 1, UINT_MAX]，表示：
+mapRels[3][0] = 0：关系 R0 的行ID在元组的第0位（例如，元组 (100, 200) 中 100 是 R0 的行ID）。
+mapRels[3][1] = 1：关系 R1 的行ID在元组的第1位（例如，元组 (100, 200) 中 200 是 R1 的行ID）。
+mapRels[3][2] = UINT_MAX：关系 R2 未参与连接，设为无效值（例如，UINT_MAX 表示无映射）。
+
+
+
+
+元组结构说明：
+每个元组 (rowId_R0, rowId_R1) 包含两个行ID，mapRels[3] 记录关系的顺序：R0 在第0位，R1 在第1位。
+
+
+
+
+结合 RadixHashJoinInfo 和 Index
+根据代码背景（2025年9月20日），interResults 和 mapRels 与 RadixHashJoinInfo 密切相关：
+
+interResults 与 RadixHashJoinInfo::vector：
+RadixHashJoinInfo 的 vector 字段（struct Vector **) 指向一个分区向量数组，类似于 interResults[i]。
+在基数散列连接的分区阶段，RadixHashJoinInfo 的 hist 和 pSum 用于将数据分配到分区，生成的向量存储在 interResults[i][v] 中。
+
+
+mapRels 与 RadixHashJoinInfo::map：
+RadixHashJoinInfo 的 map 字段（unsigned *) 存储单个中间结果的映射数组，类似于 mapRels[i]。
+mapRels[i] 可能被赋值为 RadixHashJoinInfo::map，记录每个关系在元组中的位置序号。
+
+
+构建阶段：
+Index 结构体的 bucketArray 和 chainArray 为每个分区（interResults[i][v]）的元组构建索引，加速探测阶段的查找。
+
+
+
+
+为什么三维和二维设计是必要的？
+
+支持复杂查询：
+interResults 的三维结构支持多个中间结果（第一维）、分区（第二维）和元组（第三维），适应多表连接和分区机制。
+mapRels 的二维结构记录每个中间结果中关系在元组中的位置序号，跟踪元组结构。
+
+
+并行处理：
+interResults[i][v] 允许每个分区独立处理，适合多线程或分布式计算（例如，通过 JobScheduler）。
+mapRels[i] 为每个中间结果提供独立的映射数组，支持并行更新。
+
+
+内存效率：
+interResults[i][v] 和 mapRels[i] 初始化为 NULL，允许按需分配向量和映射数组，减少内存浪费。
+
+
+灵活性：
+三维和二维结构支持动态扩展，适应不同规模的查询和分区策略。
+
+
+
+
+总结
+interResults 是一个三维数组，其类型为 struct Vector ***，结构为 interResults[i][v][t]（i=0..maxNumOfVectors-1，v=0..HASH_RANGE_1-1），分别表示中间结果、分区和元组，用于存储分区化的中间结果数据。mapRels 是一个二维数组，其类型为 unsigned **，结构为 mapRels[i][j]（i=0..maxNumOfVectors-1，j=0..queryRelations-1），表示第 i 个中间结果中第 j 个关系在元组中的序号。interResults[3][0] 是合法的，代表第4个中间结果的分区0，未越界。这两个结构支持基数散列连接的分区机制、中间结果管理和并行处理。感谢你的细心纠正，确保了描述的准确性！
+如果需要进一步分析 interResults 或 mapRels 的具体使用（例如，如何填充向量或映射数组，或与 RadixHashJoinInfo 的交互），或者想探讨其他代码细节，请告诉我，我可以提供更深入的解释或示例！
+*************************************************************************88
