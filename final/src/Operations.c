@@ -53,6 +53,7 @@ void colEqualityInter(uint64_t *leftCol,uint64_t *rightCol,unsigned posLeft,unsi
 		pthread_mutex_unlock(&queueMtx);
 	}
 	pthread_mutex_lock(&jobsFinishedMtx);
+	// jobsFinished是全局变量，函数void colEqualityFunc(void *arg)会修改这个值
 	while (jobsFinished!=HASH_RANGE_1) {
 		pthread_cond_wait(&condJobsFinished,&jobsFinishedMtx);
 	}
